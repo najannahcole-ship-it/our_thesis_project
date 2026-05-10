@@ -83,9 +83,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = "The email address entered was not recognized.";
         }
 
-    } catch (PDOException $e) {
-        die("Database connection failed: " . $e->getMessage());
-    }
+    }  catch (PDOException $e) {
+    echo "<pre>";
+    print_r($e->getMessage());
+    echo "</pre>";
+    exit;
+}
 }
 ?>
 
