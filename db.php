@@ -1,43 +1,20 @@
 <?php
-// ============================================================
-// db.php — Shared Database Connection
-// Database: juancafe
-// Include this in every PHP file that needs the DB.
-// Usage: require_once 'db.php';
-// After including, use $conn for all queries.
-// ============================================================
+declare(strict_types=1);
 
-$conn = new mysqli(
-    getenv("DB_HOST"),
-    getenv("DB_USER"),
-    getenv("DB_PASSWORD"),
-    getenv("DB_NAME"),
-    (int)getenv("DB_PORT")
-);
-
-if ($conn->connect_error) {
-    die("Database connection failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
-
-
-// ============================================================
-// HELPER: get the franchisee record for the logged-in user
-// ============================================================
-// Returns an array with id, franchisee_name, branch_name,
-// or null if this user has no linked franchisee record.
-// Requires $_SESSION['user_id'] to be set.
-// ============================================================
-function getFranchiseeByUser($conn, $user_id) {
-    $stmt = $conn->prepare(
-        "SELECT id, franchisee_name, branch_name FROM franchisees WHERE user_id = ?"
+try {
+    $pdo = new PDO(
+        "mysql:host=" . getenv("DB_HOST") .
+        ";port=" . getenv("DB_PORT") .
+        ";dbname=" . getenv("DB_NAME") .
+        ";charset=utf8mb4",
+        getenv("DB_USER"),
+        getenv("DB_PASSWORD"),
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]
     );
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $row = $result->fetch_assoc();
-    $stmt->close();
-    return $row; // null if not linked yet
+} catch (PDOException $e) {
+    die("Database connection failed: " . $e->getMessage());
 }
-?>
