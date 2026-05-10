@@ -1,11 +1,25 @@
 <?php
 // ============================================================
-// item-usage.php — Daily Item Usage Recording
+// item-usage.php — Item Usage / Default Order Items
 // DB Tables used:
-//   READ  → products    (populate item selector from real catalog)
-//   READ  → franchisees (get franchisee_id for logged-in user)
-//   READ  → orders      (find latest active order to link usage to)
-//   WRITE → item_usage  (save each usage entry on submit)
+//   READ  → products              (item selector)
+//   READ  → franchisees           (get franchisee_id)
+//   READ  → item_usage            (usage history)
+//   READ  → item_usage_defaults   (load saved locked defaults)
+//   WRITE → item_usage            (save usage submission)
+//   WRITE → item_usage_defaults   (save/delete locked defaults via AJAX)
+//
+// SQL to create defaults table (run once):
+//   CREATE TABLE IF NOT EXISTS item_usage_defaults (
+//     id            INT AUTO_INCREMENT PRIMARY KEY,
+//     franchisee_id INT NOT NULL,
+//     product_id    INT NOT NULL,
+//     quantity      INT NOT NULL DEFAULT 1,
+//     unit          VARCHAR(50) NOT NULL,
+//     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+//       ON UPDATE CURRENT_TIMESTAMP,
+//     UNIQUE KEY uq_fran_prod (franchisee_id, product_id)
+//   );
 // ============================================================
 session_start();
 if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 2) { header('Location: index.php'); exit(); }
@@ -19,42 +33,84 @@ require_once 'db.php';
 $userId   = $_SESSION['user_id'];
 $fullName = $_SESSION['full_name'] ?? 'Franchisee';
 
-// Get franchisee record linked to this user
 $franchisee   = getFranchiseeByUser($conn, $userId);
 $franchiseeId = $franchisee['id'] ?? null;
 
-// Fetch all available products for the dropdown (from real products table)
+// ── Auto-create item_usage_defaults if it doesn't exist ──────
+$conn->query("
+    CREATE TABLE IF NOT EXISTS item_usage_defaults (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        franchisee_id INT NOT NULL,
+        product_id    INT NOT NULL,
+        quantity      INT NOT NULL DEFAULT 1,
+        unit          VARCHAR(50) NOT NULL DEFAULT '',
+        updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                      ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_fran_prod (franchisee_id, product_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+");
+
+// ── Auto-add usage_ref column to item_usage if missing ───────
+$conn->query("ALTER TABLE item_usage ADD COLUMN IF NOT EXISTS `usage_ref` VARCHAR(30) NULL AFTER `id`");
+$conn->query("ALTER TABLE item_usage ADD COLUMN IF NOT EXISTS `is_default` TINYINT(1) NOT NULL DEFAULT 0 AFTER `usage_ref`");
+
+// ── AJAX: save or remove a locked default ────────────────────
+if (isset($_POST['ajax_action']) && $franchiseeId) {
+    header('Content-Type: application/json');
+    $action = $_POST['ajax_action'];
+    $pid    = intval($_POST['product_id'] ?? 0);
+    $qty    = max(1, intval($_POST['quantity'] ?? 1));
+    $unit   = trim($_POST['unit'] ?? '');
+
+    if ($action === 'lock' && $pid > 0) {
+        $stmt = $conn->prepare("
+            INSERT INTO item_usage_defaults (franchisee_id, product_id, quantity, unit, updated_at)
+            VALUES (?, ?, ?, ?, NOW())
+            ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), unit = VALUES(unit), updated_at = NOW()
+        ");
+        $stmt->bind_param("iiis", $franchiseeId, $pid, $qty, $unit);
+        $ok = $stmt->execute();
+        $stmt->close();
+        echo json_encode(['success' => $ok, 'action' => 'locked']);
+
+    } elseif ($action === 'unlock' && $pid > 0) {
+        $stmt = $conn->prepare("DELETE FROM item_usage_defaults WHERE franchisee_id = ? AND product_id = ?");
+        $stmt->bind_param("ii", $franchiseeId, $pid);
+        $ok = $stmt->execute();
+        $stmt->close();
+        echo json_encode(['success' => $ok, 'action' => 'unlocked']);
+
+    } elseif ($action === 'send_to_order') {
+        // Session-based handoff to order-form.php — no localStorage needed
+        $items = json_decode($_POST['items'] ?? '[]', true) ?: [];
+        $_SESSION['usage_handoff'] = ['items' => $items, 'ts' => time()];
+        echo json_encode(['success' => true, 'redirect' => 'order-form.php?from_usage=1']);
+
+    } else {
+        echo json_encode(['success' => false, 'error' => 'Invalid action']);
+    }
+    $conn->close(); exit();
+}
+
+// Fetch all available products for the dropdown
 $products = [];
 $prodResult = $conn->query(
     "SELECT id, name, category, unit FROM products WHERE status = 'available' ORDER BY category, name"
 );
 while ($row = $prodResult->fetch_assoc()) { $products[] = $row; }
 
-// Find the most recent active order to link usage to + get its items
-$linkedOrder     = null;
-$lastOrderItems  = []; // Pre-populate item-usage from last order
+// ── Load this franchisee's saved locked defaults ──────────────
+$savedDefaults = [];
 if ($franchiseeId) {
-    $stmt = $conn->prepare(
-        "SELECT id, po_number FROM orders WHERE franchisee_id = ? ORDER BY created_at DESC LIMIT 1"
-    );
-    $stmt->bind_param("i", $franchiseeId);
-    $stmt->execute();
-    $linkedOrder = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
-
-    // Fetch that order's items to pre-populate the usage form
-    if ($linkedOrder) {
-        $stmt = $conn->prepare("
-            SELECT p.id as product_id, p.name, p.unit, p.stock_qty, oi.quantity
-            FROM order_items oi
-            JOIN products p ON p.id = oi.product_id
-            WHERE oi.order_id = ?
-        ");
-        $stmt->bind_param("i", $linkedOrder['id']);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) { $lastOrderItems[] = $row; }
-        $stmt->close();
+    $result = $conn->query("
+        SELECT d.product_id, d.quantity, d.unit, p.name
+        FROM item_usage_defaults d
+        JOIN products p ON p.id = d.product_id
+        WHERE d.franchisee_id = {$franchiseeId}
+        ORDER BY p.name ASC
+    ");
+    if ($result) {
+        while ($row = $result->fetch_assoc()) { $savedDefaults[] = $row; }
     }
 }
 
@@ -64,60 +120,102 @@ $submitErr = '';
 $savedCount = 0;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $franchiseeId) {
-    $productIds  = $_POST['product_id'] ?? [];
-    $quantities  = $_POST['qty_used']   ?? [];
-    $units       = $_POST['unit']       ?? [];
-    $orderIdLink = intval($_POST['order_id'] ?? 0) ?: null;
-    $recordDate  = date('Y-m-d');
+    $productIds = $_POST['product_id'] ?? [];
+    $quantities = $_POST['qty_used']   ?? [];
+    $units      = $_POST['unit']       ?? [];
+    $lockedIds  = array_map('intval', $_POST['locked_id'] ?? []);
+    $recordDate = date('Y-m-d');
+    $year       = date('Y');
 
     if (empty($productIds)) {
         $submitErr = "Please add at least one item before submitting.";
     } else {
+        // ── Generate unique usage_ref: IU-YYYY-NNNN ────────────
+        $lastRef = $conn->query("
+            SELECT usage_ref FROM item_usage
+            WHERE usage_ref LIKE 'IU-{$year}-%'
+            ORDER BY id DESC LIMIT 1
+        ")->fetch_assoc()['usage_ref'] ?? null;
+
+        $nextSeq = 1;
+        if ($lastRef) {
+            $parts   = explode('-', $lastRef);
+            $nextSeq = intval(end($parts)) + 1;
+        }
+        $usageRef = 'IU-' . $year . '-' . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
+
+        // ── Save usage history ─────────────────────────────────
         $insUsage = $conn->prepare("
             INSERT INTO item_usage
-                (franchisee_id, product_id, quantity_used, unit, recording_date, submitted_at, order_id)
-            VALUES (?, ?, ?, ?, ?, NOW(), ?)
+                (usage_ref, franchisee_id, product_id, quantity_used, unit, recording_date, submitted_at, is_default)
+            VALUES (?, ?, ?, ?, ?, ?, NOW(), ?)
         ");
 
         foreach ($productIds as $i => $pid) {
-            $pid  = intval($pid);
-            $qty  = intval($quantities[$i] ?? 0);
-            $unit = $units[$i] ?? '';
+            $pid       = intval($pid);
+            $qty       = intval($quantities[$i] ?? 0);
+            $unit      = $units[$i] ?? '';
+            $isDefault = in_array($pid, $lockedIds) ? 1 : 0;
             if ($pid <= 0 || $qty <= 0) continue;
 
-            $insUsage->bind_param("iiissi", $franchiseeId, $pid, $qty, $unit, $recordDate, $orderIdLink);
+            $insUsage->bind_param("siiissi", $usageRef, $franchiseeId, $pid, $qty, $unit, $recordDate, $isDefault);
             $insUsage->execute();
             $savedCount++;
         }
         $insUsage->close();
 
+        // ── Upsert locked rows into item_usage_defaults ────────
+        // This ensures locked items survive the page reload after submit
+        if (!empty($lockedIds)) {
+            $upsert = $conn->prepare("
+                INSERT INTO item_usage_defaults (franchisee_id, product_id, quantity, unit, updated_at)
+                VALUES (?, ?, ?, ?, NOW())
+                ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), unit = VALUES(unit), updated_at = NOW()
+            ");
+            foreach ($lockedIds as $lockedPid) {
+                $idx  = array_search((string)$lockedPid, array_map('strval', $productIds));
+                if ($idx === false) continue;
+                $qty  = intval($quantities[$idx] ?? 1);
+                $unit = $units[$idx] ?? '';
+                $upsert->bind_param("iiis", $franchiseeId, $lockedPid, $qty, $unit);
+                $upsert->execute();
+            }
+            $upsert->close();
+        }
+
         if ($savedCount > 0) {
-            $submitMsg = $savedCount . ' item' . ($savedCount > 1 ? 's' : '') . ' recorded successfully for ' . date('M d, Y') . '.';
+            $submitMsg = $savedCount . ' item' . ($savedCount > 1 ? 's' : '') . ' recorded successfully for ' . date('M d, Y') . '. Reference: <strong>' . htmlspecialchars($usageRef) . '</strong>';
         } else {
             $submitErr = "No valid entries were submitted. Please select items with valid quantities.";
         }
     }
 }
 
-// Fetch recent usage history for this franchisee (last 10 entries)
+// Fetch usage history grouped by date
 $usageHistory = [];
 if ($franchiseeId) {
     $stmt = $conn->prepare("
-        SELECT iu.quantity_used, iu.unit, iu.recording_date, iu.submitted_at,
-               p.name as product_name,
-               o.po_number
+        SELECT iu.id, iu.usage_ref, iu.quantity_used, iu.unit, iu.recording_date, iu.is_default,
+               p.id as product_id, p.name as product_name
         FROM item_usage iu
         JOIN products p ON p.id = iu.product_id
-        LEFT JOIN orders o ON o.id = iu.order_id
         WHERE iu.franchisee_id = ?
-        ORDER BY iu.submitted_at DESC
-        LIMIT 10
+        ORDER BY iu.recording_date DESC, p.name ASC
+        LIMIT 100
     ");
     $stmt->bind_param("i", $franchiseeId);
     $stmt->execute();
     $result = $stmt->get_result();
     while ($row = $result->fetch_assoc()) { $usageHistory[] = $row; }
     $stmt->close();
+}
+
+// Group history by recording_date, also group by usage_ref within date
+$historyByDate = [];
+foreach ($usageHistory as $h) {
+    $date = $h['recording_date'];
+    if (!isset($historyByDate[$date])) { $historyByDate[$date] = []; }
+    $historyByDate[$date][] = $h;
 }
 
 $conn->close();
@@ -220,18 +318,42 @@ $conn->close();
         .ur-back{background:var(--background);color:var(--foreground);border:1px solid var(--card-border)!important;}
         .ur-confirm{background:var(--primary);color:white;}
         .ur-confirm:hover{background:var(--primary-light);}
-        .linked-po{font-size:.82rem;color:#1d4ed8;font-weight:600;text-decoration:none;}
-        .linked-po:hover{text-decoration:underline;}
         .empty-msg{text-align:center;color:var(--muted);padding:2rem;font-size:.9rem;font-style:italic;}
 
-        /* History table */
+        /* Lock / unlock button */
+        .btn-unlock{background:#fef3c7;border:1.5px solid #fde68a;color:#92400e;cursor:pointer;padding:.3rem .6rem;border-radius:8px;font-size:.75rem;font-weight:700;display:inline-flex;align-items:center;gap:.25rem;transition:all .15s;}
+        .btn-unlock:hover{background:#fde68a;}
+        .lock-label{font-size:.72rem;font-weight:700;letter-spacing:.01em;}
+        tr.row-locked td{background:#fffdf5 !important;}
+        tr.row-locked .qty-input{color:var(--muted);}
+        .default-badge{font-size:.7rem;color:#d97706;font-weight:700;background:#fef3c7;border:1px solid #fde68a;padding:.1rem .45rem;border-radius:20px;margin-left:.4rem;vertical-align:middle;}
+
+        /* History accordion */
         .history-card{margin-top:0;}
         .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:.4rem;}
+        .hist-date-group{border:1px solid var(--card-border);border-radius:12px;margin-bottom:.6rem;overflow:hidden;}
+        .hist-date-header{display:flex;align-items:center;justify-content:space-between;padding:.875rem 1.25rem;cursor:pointer;background:#fdfaf7;transition:background .15s;user-select:none;}
+        .hist-date-header:hover{background:#f5ede6;}
+        .hist-date-header .date-label{font-weight:700;font-size:.95rem;display:flex;align-items:center;gap:.6rem;}
+        .hist-date-header .item-count-badge{font-size:.75rem;color:var(--primary);background:#f5ede6;padding:.15rem .55rem;border-radius:20px;font-weight:600;}
+        .hist-chevron{transition:transform .2s;color:var(--muted);}
+        .hist-date-header.open .hist-chevron{transform:rotate(180deg);}
+        .hist-date-body{display:none;border-top:1px solid var(--card-border);}
+        .hist-date-body.open{display:block;}
+        .hist-date-body table{width:100%;border-collapse:collapse;}
+        .hist-date-body td{padding:.7rem 1.25rem;font-size:.88rem;border-bottom:1px solid var(--card-border);}
+        .hist-date-body tr:last-child td{border-bottom:none;}
+        /* Load-into-form button on date header */
+        .btn-load-date{background:var(--primary);color:white;border:none;padding:.35rem .8rem;border-radius:8px;font-size:.78rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:.35rem;font-family:inherit;transition:background .15s;white-space:nowrap;flex-shrink:0;}
+        .btn-load-date:hover{background:var(--primary-light);}
+        .btn-load-date.loaded{background:#10b981;}
+        /* Grayed-out already-added options in selector */
+        .item-selector option:disabled{color:#ccc;font-style:italic;}
     </style>
 </head>
 <body>
 <aside>
-    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
+    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
     <div class="menu-label">Menu</div>
     <nav>
         <a href="franchisee-dashboard.php" class="nav-item"><i data-lucide="layout-dashboard"></i> Dashboard</a>
@@ -239,7 +361,7 @@ $conn->close();
         <a href="item-usage.php" class="nav-item active"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile">
@@ -252,14 +374,14 @@ $conn->close();
 <main>
     <div class="header">
         <h2>Item Usage Recording</h2>
-        <p>Record daily consumption to maintain accurate inventory levels.</p>
+        <p>Set your default products and record daily consumption — default items auto-load into the Order Form.</p>
     </div>
 
     <!-- Success / Error messages from DB submission -->
     <?php if ($submitMsg): ?>
     <div class="alert-success">
         <i data-lucide="check-circle" size="18"></i>
-        <span><?php echo htmlspecialchars($submitMsg); ?></span>
+        <span><?php echo $submitMsg; ?></span>
     </div>
     <?php endif; ?>
     <?php if ($submitErr): ?>
@@ -276,27 +398,16 @@ $conn->close();
     <?php endif; ?>
 
     <form id="usageForm" method="POST" action="item-usage.php">
-        <!-- Pass linked order ID -->
-        <input type="hidden" name="order_id" value="<?php echo $linkedOrder ? $linkedOrder['id'] : 0; ?>">
 
         <div class="page-grid">
             <!-- LEFT: Recording section -->
             <div>
                 <div class="card">
-                    <!-- Linked order info banner -->
-                    <!-- Flow explanation banner -->
+                    <!-- Info banner -->
                     <div class="usage-info-banner">
                         <i data-lucide="info" size="16" style="flex-shrink:0;margin-top:.1rem;"></i>
-                        <span>This is your <strong>daily consumption record</strong> — track what your branch uses each day. Pre-filled from your last order. You can also <strong>send these items directly to the Order Form</strong> to place a new purchase order.</span>
+                        <span>Add the items you regularly use, then <strong>🔒 lock</strong> the ones you always order — they'll be remembered and loaded back here every time. Unlock any item to edit its quantity or remove it.</span>
                     </div>
-
-                    <?php if ($linkedOrder): ?>
-                    <div class="alert-info">
-                        <i data-lucide="link" size="16"></i>
-                        <span>This report will be linked to order <strong><?php echo htmlspecialchars($linkedOrder['po_number']); ?></strong>.</span>
-                        <a href="order-status.php?po=<?php echo urlencode($linkedOrder['po_number']); ?>" class="linked-po" style="margin-left:auto;">View Order →</a>
-                    </div>
-                    <?php endif; ?>
 
                     <!-- Item selector -->
                     <div class="add-bar">
@@ -326,39 +437,140 @@ $conn->close();
                     <!-- Usage table -->
                     <table>
                         <thead>
-                            <tr><th>Item Name</th><th>Unit</th><th>Quantity Used</th><th style="width:40px;"></th></tr>
+                            <tr>
+                                <th>Item Name</th>
+                                <th>Unit</th>
+                                <th>Quantity Used</th>
+                                <th style="width:120px;text-align:center;">
+                                    <button type="button" id="lockAllBtn" onclick="lockAllItems()"
+                                        style="background:#f59e0b;border:none;color:white;padding:.35rem .8rem;border-radius:8px;font-size:.75rem;font-weight:700;cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;gap:.3rem;">
+                                        🔒 Lock All
+                                    </button>
+                                </th>
+                                <th style="width:40px;"></th>
+                            </tr>
                         </thead>
                         <tbody id="usageBody"></tbody>
                     </table>
                     <div id="emptyMsg" class="empty-msg">No items added yet. Use the selector above to add items.</div>
                 </div>
 
-                <!-- Recent history from DB -->
-                <?php if (!empty($usageHistory)): ?>
+                <!-- Recent history — accordion with date picker beside title -->
+                <?php if (!empty($historyByDate)): ?>
+                <?php
+                $allDateData = [];
+                foreach ($historyByDate as $date => $entries) {
+                    $dlabel = date('D, M d, Y', strtotime($date));
+                    $dateItems = [];
+                    foreach ($entries as $e) {
+                        $pid = $e['product_id'];
+                        if (!isset($dateItems[$pid])) {
+                            $dateItems[$pid] = ['pid' => $pid, 'name' => $e['product_name'], 'unit' => $e['unit'], 'qty' => 0];
+                        }
+                        $dateItems[$pid]['qty'] += intval($e['quantity_used']);
+                    }
+                    $allDateData[$date] = [
+                        'label' => $dlabel,
+                        'count' => count($entries),
+                        'items' => array_values($dateItems),
+                        'raw'   => $entries
+                    ];
+                }
+                ?>
                 <div class="card history-card">
-                    <h3 class="section-title"><i data-lucide="history"></i> Recent Usage History</h3>
-                    <table>
-                        <thead>
-                            <tr><th>Item</th><th>Qty</th><th>Unit</th><th>Date</th><th>Linked Order</th></tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($usageHistory as $h): ?>
-                            <tr>
-                                <td><span class="status-dot"></span><?php echo htmlspecialchars($h['product_name']); ?></td>
-                                <td style="font-weight:700;"><?php echo $h['quantity_used']; ?></td>
-                                <td style="color:var(--muted);"><?php echo htmlspecialchars($h['unit']); ?></td>
-                                <td style="color:var(--muted);font-size:.85rem;"><?php echo date('M d, Y', strtotime($h['recording_date'])); ?></td>
-                                <td style="font-size:.85rem;">
-                                    <?php if ($h['po_number']): ?>
-                                        <a href="order-status.php?po=<?php echo urlencode($h['po_number']); ?>" class="linked-po"><?php echo htmlspecialchars($h['po_number']); ?></a>
-                                    <?php else: ?>
-                                        <span style="color:var(--muted);">—</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
+                    <!-- Title row with inline date picker -->
+                    <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem;">
+                        <h3 class="section-title" style="margin-bottom:0;flex-shrink:0;">
+                            <i data-lucide="history"></i> Recent Usage History
+                        </h3>
+                        <select id="histDatePicker" onchange="jumpToDate(this.value)"
+                            style="flex:1;min-width:180px;padding:.45rem .8rem;border-radius:9px;border:1.5px solid var(--card-border);font-size:.84rem;font-family:inherit;background:white;cursor:pointer;color:var(--foreground);">
+                            <option value="">— Jump to date —</option>
+                            <?php foreach ($historyByDate as $date => $entries):
+                                $dlabel = date('D, M d, Y', strtotime($date));
+                                $dcount = count($entries);
+                            ?>
+                            <option value="<?php echo $date; ?>"><?php echo $dlabel; ?> (<?php echo $dcount; ?> item<?php echo $dcount > 1 ? 's' : ''; ?>)</option>
                             <?php endforeach; ?>
-                        </tbody>
-                    </table>
+                        </select>
+                    </div>
+
+                    <!-- Accordion groups -->
+                    <div id="histAccordion">
+                    <?php $isFirst = true; foreach ($historyByDate as $date => $entries):
+                        $label = date('D, M d, Y', strtotime($date));
+                        $count = count($entries);
+                        $dateItems = $allDateData[$date]['items'];
+                        $dateItemsJson = htmlspecialchars(json_encode($dateItems), ENT_QUOTES);
+                        // Group entries by usage_ref within this date
+                        $refGroups = [];
+                        foreach ($entries as $e) {
+                            $ref = $e['usage_ref'] ?? '—';
+                            if (!isset($refGroups[$ref])) $refGroups[$ref] = [];
+                            $refGroups[$ref][] = $e;
+                        }
+                    ?>
+                    <div class="hist-date-group" data-date="<?php echo $date; ?>">
+                        <div class="hist-date-header <?php echo $isFirst ? 'open' : ''; ?>"
+                             onclick="toggleHistDate(this)">
+                            <span class="date-label">
+                                <i data-lucide="calendar" size="15" style="color:var(--primary);"></i>
+                                <?php echo $label; ?>
+                                <span class="item-count-badge"><?php echo $count; ?> item<?php echo $count > 1 ? 's' : ''; ?></span>
+                            </span>
+                            <div style="display:flex;align-items:center;gap:.6rem;" onclick="event.stopPropagation()">
+                                <button type="button" class="btn-load-date"
+                                        data-items="<?php echo $dateItemsJson; ?>"
+                                        onclick="loadDateItems(this, event)"
+                                        title="Load these items into the form above">
+                                    <i data-lucide="corner-left-up" size="13"></i>
+                                    Load into form
+                                </button>
+                                <i data-lucide="chevron-down" size="18" class="hist-chevron" style="pointer-events:none;"></i>
+                            </div>
+                        </div>
+                        <div class="hist-date-body <?php echo $isFirst ? 'open' : ''; ?>">
+                            <?php foreach ($refGroups as $ref => $refEntries):
+                                $hasDefault = array_sum(array_column($refEntries, 'is_default')) > 0;
+                            ?>
+                            <!-- Ref group header -->
+                            <div style="display:flex;align-items:center;gap:.6rem;padding:.55rem 1.25rem;background:#fafaf9;border-bottom:1px solid var(--card-border);">
+                                <span style="font-size:.72rem;font-weight:700;color:var(--primary);background:#f5ede6;padding:.15rem .55rem;border-radius:6px;letter-spacing:.03em;"><?php echo htmlspecialchars($ref); ?></span>
+                                <?php if ($hasDefault): ?>
+                                <span style="font-size:.68rem;font-weight:700;color:#d97706;background:#fef3c7;border:1px solid #fde68a;padding:.1rem .4rem;border-radius:6px;">⭐ Includes Defaults</span>
+                                <?php endif; ?>
+                            </div>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th style="padding:.5rem 1.25rem;font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">Product</th>
+                                        <th style="padding:.5rem 1.25rem;font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">Qty</th>
+                                        <th style="padding:.5rem 1.25rem;font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">Unit</th>
+                                        <th style="padding:.5rem 1.25rem;font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">Type</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($refEntries as $h): ?>
+                                    <tr>
+                                        <td><span class="status-dot"></span><?php echo htmlspecialchars($h['product_name']); ?></td>
+                                        <td style="font-weight:700;color:var(--primary);"><?php echo $h['quantity_used']; ?></td>
+                                        <td style="color:var(--muted);"><?php echo htmlspecialchars($h['unit']); ?></td>
+                                        <td>
+                                            <?php if ($h['is_default']): ?>
+                                            <span style="font-size:.7rem;font-weight:700;color:#d97706;background:#fef3c7;border:1px solid #fde68a;padding:.1rem .4rem;border-radius:6px;">Default</span>
+                                            <?php else: ?>
+                                            <span style="font-size:.7rem;color:var(--muted);">Manual</span>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
+                    <?php $isFirst = false; endforeach; ?>
+                    </div><!-- end histAccordion -->
                 </div>
                 <?php endif; ?>
             </div>
@@ -376,14 +588,10 @@ $conn->close();
                         <span class="s-label">Recording Date</span>
                         <span class="s-value"><?php echo date('M d, Y'); ?></span>
                     </div>
-                    <?php if ($linkedOrder): ?>
                     <div class="summary-row">
-                        <span class="s-label">Linked Order</span>
-                        <a href="order-status.php?po=<?php echo urlencode($linkedOrder['po_number']); ?>" class="linked-po s-value">
-                            <?php echo htmlspecialchars($linkedOrder['po_number']); ?>
-                        </a>
+                        <span class="s-label">Locked (Default)</span>
+                        <span class="s-value" id="lockedCount">0</span>
                     </div>
-                    <?php endif; ?>
 
                     <div style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid var(--card-border);">
                         <p style="font-size:.85rem;color:var(--muted);line-height:1.6;">
@@ -404,6 +612,10 @@ $conn->close();
                         <i data-lucide="shopping-cart" size="16" style="display:inline;vertical-align:middle;margin-right:.4rem;"></i>
                         Send to Order Form →
                     </button>
+
+                    <p style="font-size:.78rem;color:var(--muted);margin-top:.875rem;text-align:center;line-height:1.5;">
+                        You can also load a past date's items using <strong>Load into form</strong> in the history below.
+                    </p>
                 </div>
             </div>
         </div>
@@ -428,9 +640,6 @@ $conn->close();
             </div>
             <div style="margin-top:1rem;padding:.875rem;background:var(--background);border-radius:10px;font-size:.85rem;">
                 <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Recording Date</span><strong><?php echo date('M d, Y'); ?></strong></div>
-                <?php if ($linkedOrder): ?>
-                <div style="display:flex;justify-content:space-between;margin-top:.4rem;"><span style="color:var(--muted);">Linked Order</span><strong><?php echo htmlspecialchars($linkedOrder['po_number']); ?></strong></div>
-                <?php endif; ?>
             </div>
         </div>
         <div class="ur-foot">
@@ -474,50 +683,106 @@ $conn->close();
 
     const addedIds = new Set();
 
-    // Pre-populate items from the franchisee's last order (Req 3 & 5)
-    const lastOrderItems = <?php echo json_encode($lastOrderItems); ?>;
+    // Saved defaults from DB (pre-loaded on page open)
+    const savedDefaults = <?php echo json_encode($savedDefaults); ?>;
 
-    function buildRow(pid, name, unit, qty) {
+    function buildRow(pid, name, unit, qty, isLocked) {
         addedIds.add(String(pid));
         const tbody = document.getElementById('usageBody');
         const row   = document.createElement('tr');
         row.dataset.pid = pid;
+        if (isLocked) row.classList.add('row-locked');
         row.innerHTML = `
             <td>
-                <strong>${name}</strong>
+                <strong>${name}</strong>${isLocked ? '<span class="default-badge">Default</span>' : ''}
                 <input type="hidden" name="product_id[]" value="${pid}">
                 <input type="hidden" name="unit[]" value="${unit}" class="unit-field">
+                ${isLocked ? `<input type="hidden" name="locked_id[]" value="${pid}" class="locked-field">` : ''}
             </td>
             <td style="color:var(--muted);">${unit}</td>
             <td>
                 <div class="qty-wrap">
-                    <button type="button" class="qty-btn" onclick="adj(this,-1)">
+                    <button type="button" class="qty-btn" onclick="adj(this,-1)" ${isLocked ? 'disabled' : ''}>
                         <i data-lucide="minus" size="13"></i>
                     </button>
-                    <input type="text" class="qty-input" name="qty_used[]" value="${qty}" min="1">
-                    <button type="button" class="qty-btn" onclick="adj(this,1)">
+                    <input type="text" class="qty-input" name="qty_used[]" value="${qty}" min="1" ${isLocked ? 'readonly' : ''}>
+                    <button type="button" class="qty-btn" onclick="adj(this,1)" ${isLocked ? 'disabled' : ''}>
                         <i data-lucide="plus" size="13"></i>
                     </button>
                 </div>
             </td>
+            <td style="text-align:center;">
+                ${isLocked
+                    ? `<button type="button" class="btn-unlock" onclick="unlockRow(this)"
+                            title="Unlock to edit or remove">
+                            <i data-lucide="lock-open" size="13"></i> Unlock
+                        </button>`
+                    : `<span style="color:#d1c5bb;font-size:.75rem;">—</span>`
+                }
+            </td>
             <td>
-                <button type="button" class="btn-del" onclick="removeItem(this,'${pid}')">
+                <button type="button" class="btn-del" onclick="removeItem(this,'${pid}')" ${isLocked ? 'disabled style="opacity:.2;cursor:default;"' : ''}>
                     <i data-lucide="trash-2" size="17"></i>
                 </button>
             </td>`;
         tbody.appendChild(row);
     }
 
-    // On page load: pre-populate from last order if items exist
-    window.addEventListener('DOMContentLoaded', () => {
-        if (lastOrderItems && lastOrderItems.length > 0) {
-            lastOrderItems.forEach(item => {
-                buildRow(item.product_id, item.name, item.unit, item.quantity);
+    // ── localStorage state persistence key ───────────────────────
+    const USAGE_STATE_KEY = 'jc_item_usage_state_<?php echo (int)$franchiseeId; ?>';
+    const ORDER_DRAFT_KEY = 'jc_order_draft_<?php echo (int)$franchiseeId; ?>';
+
+    // Save current unlocked rows to localStorage (locked ones reload from DB)
+    function saveState() {
+        try {
+            const rows = document.querySelectorAll('#usageBody tr');
+            const items = [];
+            rows.forEach(row => {
+                if (row.classList.contains('row-locked')) return; // locked = DB handles it
+                const pid  = row.dataset.pid;
+                const name = row.querySelector('strong')?.innerText?.replace(' Default','').trim() || '';
+                const unit = row.querySelector('.unit-field')?.value || '';
+                const qty  = row.querySelector('.qty-input')?.value || '1';
+                if (pid) items.push({ pid, name, unit, qty });
+            });
+            localStorage.setItem(USAGE_STATE_KEY, JSON.stringify({ items, ts: Date.now() }));
+        } catch(e) {}
+    }
+
+    // Restore unlocked rows from localStorage on page load
+    function restoreState() {
+        try {
+            const raw = localStorage.getItem(USAGE_STATE_KEY);
+            if (!raw) return;
+            const data = JSON.parse(raw);
+            // Expire after 4 hours
+            if (!data?.items?.length || (Date.now() - data.ts) > 14400000) return;
+            data.items.forEach(item => {
+                if (!addedIds.has(String(item.pid))) {
+                    buildRow(item.pid, item.name, item.unit, item.qty, false);
+                }
             });
             lucide.createIcons();
             updateCount();
+            refreshSelectorDisabled();
+        } catch(e) {}
+    }
+
+    // On page load: first restore locked defaults from DB, then unlocked from localStorage
+    window.addEventListener('DOMContentLoaded', () => {
+        // 1. Load locked defaults from DB (server-rendered)
+        if (savedDefaults && savedDefaults.length > 0) {
+            savedDefaults.forEach(item => {
+                buildRow(item.product_id, item.name, item.unit, item.quantity, true);
+            });
         }
-    }); // Prevent duplicate items
+        // 2. Restore unlocked rows from localStorage
+        restoreState();
+
+        lucide.createIcons();
+        updateCount();
+        refreshSelectorDisabled();
+    });
 
     function addItem() {
         const sel = document.getElementById('itemSelector');
@@ -537,32 +802,261 @@ $conn->close();
             sel.selectedIndex = 0;
             return;
         }
-        buildRow(pid, name, unit, 1);
+        buildRow(pid, name, unit, 1, false);
         lucide.createIcons();
         updateCount();
+        refreshSelectorDisabled();
+        saveState();
         sel.selectedIndex = 0;
+    }
+
+    // Gray out already-added options in the selector
+    function refreshSelectorDisabled() {
+        const sel = document.getElementById('itemSelector');
+        Array.from(sel.options).forEach(opt => {
+            if (!opt.value) return;
+            if (addedIds.has(String(opt.value))) {
+                opt.disabled = true;
+                opt.text = opt.dataset.name + ' (' + opt.dataset.unit + ') — already added';
+            } else {
+                opt.disabled = false;
+                opt.text = opt.dataset.name + ' (' + opt.dataset.unit + ')';
+            }
+        });
+    }
+
+    // Load all items from a history date into the form table
+    function loadDateItems(btn, event) {
+        event.stopPropagation(); // Don't toggle accordion
+        const items = JSON.parse(btn.dataset.items || '[]');
+        if (!items.length) return;
+
+        let added = 0;
+        items.forEach(item => {
+            const pid  = String(item.pid);
+            const name = item.name;
+            const unit = item.unit;
+            const qty  = item.qty || 1;
+
+            if (addedIds.has(pid)) {
+                // Already in table — just bump the quantity
+                const existing = document.querySelector(`tr[data-pid="${pid}"]`);
+                if (existing) {
+                    const qtyInput = existing.querySelector('.qty-input');
+                    if (qtyInput && !existing.classList.contains('row-locked')) {
+                        qtyInput.value = qty;
+                    }
+                }
+            } else {
+                buildRow(pid, name, unit, qty, false);
+                added++;
+            }
+        });
+
+        lucide.createIcons();
+        updateCount();
+        refreshSelectorDisabled();
+        saveState();
+        btn.classList.add('loaded');
+        btn.innerHTML = '<i data-lucide="check" size="13"></i> Loaded!';
+        lucide.createIcons();
+        setTimeout(() => {
+            btn.classList.remove('loaded');
+            btn.innerHTML = '<i data-lucide="corner-left-up" size="13"></i> Load into form';
+            lucide.createIcons();
+        }, 2000);
+
+        // Scroll up to the form table smoothly
+        document.getElementById('usageBody').closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function adj(btn, delta) {
         const input = btn.parentElement.querySelector('.qty-input');
         input.value = Math.max(1, (parseInt(input.value) || 1) + delta);
+        saveState();
     }
 
     function removeItem(btn, pid) {
-        btn.closest('tr').remove();
+        const row = btn.closest('tr');
+        if (row.classList.contains('row-locked')) {
+            row.style.outline = '2px solid #f59e0b';
+            setTimeout(() => row.style.outline = '', 1200);
+            return;
+        }
+        row.remove();
         addedIds.delete(pid);
         updateCount();
+        refreshSelectorDisabled();
+        saveState();
     }
 
     function updateCount() {
-        const n = document.querySelectorAll('#usageBody tr').length;
-        document.getElementById('itemCount').innerText  = n;
+        const n      = document.querySelectorAll('#usageBody tr').length;
+        const locked = document.querySelectorAll('#usageBody tr.row-locked').length;
+        document.getElementById('itemCount').innerText    = n;
+        document.getElementById('lockedCount').innerText  = locked;
         document.getElementById('emptyMsg').style.display = n === 0 ? 'block' : 'none';
-        document.getElementById('submitBtn').disabled  = n === 0;
-        document.getElementById('proceedBtn').disabled = n === 0;
+        document.getElementById('submitBtn').disabled     = n === 0;
+        document.getElementById('proceedBtn').disabled    = n === 0;
     }
 
-    updateCount();
+    // All history date data from PHP
+    const allDateData = <?php echo json_encode($allDateData ?? []); ?>;
+
+    // ── Lock All — one click locks every row, batch AJAX save ──
+    function lockAllItems() {
+        const rows = document.querySelectorAll('#usageBody tr:not(.row-locked)');
+        if (rows.length === 0) return;
+
+        const toSave = [];
+        rows.forEach(row => {
+            const pid   = row.dataset.pid;
+            const qty   = row.querySelector('.qty-input')?.value || '1';
+            const unit  = row.querySelector('.unit-field')?.value || '';
+            const name  = row.querySelector('strong')?.innerText?.replace(' Default','').trim() || '';
+            const badge = row.querySelector('.default-badge');
+            const firstTd = row.querySelector('td:first-child');
+
+            // Visual: lock the row immediately
+            row.classList.add('row-locked');
+            row.style.background = '';
+
+            // Disable qty controls
+            row.querySelectorAll('.qty-btn').forEach(b => b.disabled = true);
+            const qi = row.querySelector('.qty-input');
+            if (qi) qi.readOnly = true;
+
+            // Add Default badge
+            if (!badge) {
+                const b = document.createElement('span');
+                b.className = 'default-badge'; b.textContent = 'Default';
+                row.querySelector('strong').after(b);
+            }
+
+            // Add locked_id hidden input
+            if (!firstTd.querySelector('.locked-field')) {
+                const h = document.createElement('input');
+                h.type = 'hidden'; h.name = 'locked_id[]';
+                h.value = pid; h.className = 'locked-field';
+                firstTd.appendChild(h);
+            }
+
+            // Swap action cell: replace "—" with Unlock button, disable delete
+            const actionTd = row.querySelectorAll('td')[3];
+            if (actionTd) actionTd.innerHTML = `<button type="button" class="btn-unlock" onclick="unlockRow(this)" title="Unlock to edit or remove"><i data-lucide="lock-open" size="13"></i> Unlock</button>`;
+            const delBtn = row.querySelector('.btn-del');
+            if (delBtn) { delBtn.disabled = true; delBtn.style.opacity = '.2'; delBtn.style.cursor = 'default'; }
+
+            toSave.push({ pid, qty, unit });
+        });
+
+        lucide.createIcons();
+        updateCount();
+
+        // Batch save to DB
+        toSave.forEach(item => {
+            const fd = new FormData();
+            fd.append('ajax_action', 'lock');
+            fd.append('product_id', item.pid);
+            fd.append('quantity', item.qty);
+            fd.append('unit', item.unit);
+            fetch('item-usage.php', { method: 'POST', body: fd }).catch(() => {});
+        });
+
+        // Visual feedback on Lock All button
+        const btn = document.getElementById('lockAllBtn');
+        if (btn) {
+            btn.textContent = '✓ All Locked!';
+            btn.style.background = '#10b981';
+            setTimeout(() => {
+                btn.innerHTML = '🔒 Lock All';
+                btn.style.background = '#f59e0b';
+            }, 1500);
+        }
+    }
+
+    // ── Unlock a single row to allow editing ──────────────────
+    function unlockRow(btn) {
+        const row     = btn.closest('tr');
+        const pid     = row.dataset.pid;
+        const unit    = row.querySelector('.unit-field')?.value || '';
+        const qty     = row.querySelector('.qty-input')?.value || '1';
+
+        // Visual: unlock
+        row.classList.remove('row-locked');
+        row.querySelector('.default-badge')?.remove();
+
+        // Re-enable qty controls
+        row.querySelectorAll('.qty-btn').forEach(b => b.disabled = false);
+        const qi = row.querySelector('.qty-input');
+        if (qi) qi.readOnly = false;
+
+        // Remove locked_id hidden input
+        row.querySelector('.locked-field')?.remove();
+
+        // Restore action cell to "—" and re-enable delete
+        const actionTd = row.querySelectorAll('td')[3];
+        if (actionTd) actionTd.innerHTML = `<span style="color:#d1c5bb;font-size:.75rem;">—</span>`;
+        const delBtn = row.querySelector('.btn-del');
+        if (delBtn) { delBtn.disabled = false; delBtn.style.opacity = '1'; delBtn.style.cursor = 'pointer'; }
+
+        lucide.createIcons();
+        updateCount();
+        saveState();
+
+        // Remove from DB defaults
+        const fd = new FormData();
+        fd.append('ajax_action', 'unlock');
+        fd.append('product_id', pid);
+        fetch('item-usage.php', { method: 'POST', body: fd }).catch(() => {});
+    }
+
+    // ── Jump to date: moves selected group to top and opens it ──
+    function jumpToDate(date) {
+        if (!date) return;
+        const accordion = document.getElementById('histAccordion');
+        if (!accordion) return;
+
+        // Find by looping — avoids any CSS selector escaping issues with dates
+        let target = null;
+        accordion.querySelectorAll('.hist-date-group').forEach(g => {
+            if (g.getAttribute('data-date') === date) target = g;
+        });
+        if (!target) return;
+
+        // Close all groups
+        accordion.querySelectorAll('.hist-date-group').forEach(g => {
+            const h = g.querySelector('.hist-date-header');
+            const b = g.querySelector('.hist-date-body');
+            if (h) h.classList.remove('open');
+            if (b) b.classList.remove('open');
+        });
+
+        // Move target to top and open it
+        accordion.prepend(target);
+        const th = target.querySelector('.hist-date-header');
+        const tb = target.querySelector('.hist-date-body');
+        if (th) th.classList.add('open');
+        if (tb) tb.classList.add('open');
+
+        // Scroll to it
+        setTimeout(() => {
+            target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 50);
+
+        // Reset picker
+        setTimeout(() => {
+            const picker = document.getElementById('histDatePicker');
+            if (picker) picker.value = '';
+        }, 1000);
+    }
+
+    // ── History date accordion toggle ─────────────────────────
+    function toggleHistDate(header) {
+        const body = header.nextElementSibling;
+        header.classList.toggle('open');
+        body.classList.toggle('open');
+    }
 
     // ── Usage Review Modal functions ───────────────────────────
     function openUsageReview() {
@@ -590,6 +1084,8 @@ $conn->close();
     }
 
     function submitUsageConfirmed() {
+        // Clear the persisted state — items were recorded, start fresh next visit
+        try { localStorage.removeItem(USAGE_STATE_KEY); } catch(e) {}
         document.getElementById('usageReviewModal').classList.remove('open');
         document.getElementById('usageForm').submit();
     }
@@ -598,9 +1094,7 @@ $conn->close();
         if (e.target === this) closeUsageReview();
     });
 
-    // ── Proceed to Order Form functions ────────────────────────
-    const USAGE_HANDOFF_KEY = 'jc_usage_to_order_<?php echo (int)$franchiseeId; ?>';
-
+    // ── Proceed to Order Form — session-based handoff ──────────
     function openProceedReview() {
         const rows = document.querySelectorAll('#usageBody tr');
         if (rows.length === 0) return;
@@ -629,29 +1123,45 @@ $conn->close();
     }
 
     function proceedToOrderForm() {
-        // Collect all current rows into a handoff payload
         const rows = document.querySelectorAll('#usageBody tr');
         const items = [];
         rows.forEach(row => {
             const pid  = row.dataset.pid;
+            const name = row.querySelector('strong')?.innerText?.replace(' Default','').trim() || '';
             const qty  = row.querySelector('.qty-input')?.value || '1';
-            if (pid) items.push({ pid, qty });
+            const unit = row.querySelector('.unit-field')?.value || '';
+            if (pid) items.push({ pid: String(pid), name, qty: String(qty), unit });
         });
 
         if (items.length === 0) { closeProceedReview(); return; }
 
-        // Save to localStorage — order-form.php will read this on load
+        // Write DIRECTLY into order-form's draft localStorage key — no session needed
         try {
-            localStorage.setItem(USAGE_HANDOFF_KEY, JSON.stringify({ items, ts: Date.now() }));
+            localStorage.setItem(ORDER_DRAFT_KEY, JSON.stringify({
+                items,
+                delivery: 'Standard Delivery',
+                payment:  'Cash',
+                ts: Date.now()
+            }));
         } catch(e) {}
 
-        // Navigate to order form
-        window.location.href = 'order-form.php?from_usage=1';
+        // Also save via PHP session as belt-and-suspenders
+        const fd = new FormData();
+        fd.append('ajax_action', 'send_to_order');
+        fd.append('items', JSON.stringify(items));
+
+        fetch('item-usage.php', { method: 'POST', body: fd })
+            .finally(() => {
+                window.location.href = 'order-form.php?from_usage=1';
+            });
     }
 
     document.getElementById('proceedReviewModal').addEventListener('click', function(e) {
         if (e.target === this) closeProceedReview();
     });
+
+    updateCount();
+    lucide.createIcons();
 </script>
 </body>
 </html>

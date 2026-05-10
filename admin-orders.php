@@ -1272,6 +1272,15 @@ function fmtDate($dt) {
                         <label>Payment Method</label>
                         <p id="md-payment"></p>
                         <p class="sub" id="md-payment-status"></p>
+                        <div id="md-ref-wrap" style="display:none;margin-top:.4rem;">
+                            <span style="font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:700;">Ref #</span>
+                            <span id="md-ref" style="display:block;font-size:.9rem;color:var(--foreground);font-weight:600;margin-top:.1rem;"></span>
+                        </div>
+                        <div id="md-screenshot-wrap" style="display:none;margin-top:.5rem;">
+                            <button id="md-screenshot-btn" type="button" onclick="" style="display:inline-flex;align-items:center;gap:.4rem;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:8px;padding:.35rem .85rem;font-size:.82rem;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s;">
+                                🖼 View Photo
+                            </button>
+                        </div>
                     </div>
                     <div class="detail-group">
                         <label>Estimated Total</label>
@@ -1308,13 +1317,6 @@ function fmtDate($dt) {
                     <div class="total-row"><span class="t-label">Subtotal</span><span id="md-subtotal"></span></div>
                     <div class="total-row"><span class="t-label">Delivery Fee</span><span id="md-fee"></span></div>
                     <div class="total-row grand"><span class="t-label">Grand Total</span><span id="md-grand"></span></div>
-                    <div class="total-row" id="md-ref-wrap" style="display:none;margin-top:.6rem;"><span class="t-label">Payment Ref #</span><span id="md-ref" style="font-size:.85rem;color:var(--muted);font-family:monospace;"></span></div>
-                    <div class="total-row" id="md-screenshot-wrap" style="display:none;margin-top:.5rem;align-items:center;">
-                        <span class="t-label">Payment Proof</span>
-                        <button id="md-screenshot-btn" type="button" onclick="" style="display:inline-flex;align-items:center;gap:.4rem;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:8px;padding:.35rem .85rem;font-size:.82rem;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s;">
-                            🖼 View Photo
-                        </button>
-                    </div>
                 </div>
 
                 <!-- Payment Proof Banner: shown when order has ref + screenshot (Paid) -->
@@ -1475,7 +1477,7 @@ function fmtDate($dt) {
             const refEl   = document.getElementById('md-ref');
             if (order.payment_ref) {
                 refEl.textContent     = order.payment_ref;
-                refWrap.style.display = 'flex';
+                refWrap.style.display = 'block';
             } else {
                 refWrap.style.display = 'none';
             }
@@ -1485,7 +1487,7 @@ function fmtDate($dt) {
             const screenshotBtn  = document.getElementById('md-screenshot-btn');
             if (order.payment_proof) {
                 screenshotBtn.onclick = () => openScreenshotLightbox(order.payment_proof);
-                screenshotWrap.style.display = 'flex';
+                screenshotWrap.style.display = 'block';
             } else {
                 screenshotWrap.style.display = 'none';
             }

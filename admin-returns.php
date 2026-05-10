@@ -23,19 +23,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     // ── Get single return detail ──────────────────────────────
     if ($action === 'get_return') {
         $id = (int)($_POST['id'] ?? 0);
+
+        // Fetch the primary row
         $stmt = $conn->prepare("
-            SELECT r.*, f.branch_name, f.franchisee_name,
-                   o.po_number
+            SELECT r.*, f.branch_name,
+                   COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
+                   o.po_number, o.assigned_encoder_id,
+                   enc.full_name AS encoder_name
             FROM returns r
-            LEFT JOIN franchisees f ON f.id = r.franchisee_id
-            LEFT JOIN orders      o ON o.id = r.order_id
+            LEFT JOIN franchisees f  ON f.id         = r.franchisee_id
+            LEFT JOIN users      uf  ON uf.user_id   = f.user_id
+            LEFT JOIN orders      o  ON o.id          = r.order_id
+            LEFT JOIN users      enc ON enc.user_id  = o.assigned_encoder_id
             WHERE r.id = ?
         ");
         $stmt->bind_param("i", $id);
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
-        echo json_encode($row ?: ['error' => 'Not found']);
+
+        if (!$row) { echo json_encode(['error' => 'Not found']); exit(); }
+
+        // Fetch ALL items in the same batch (same franchisee + order + within same minute)
+        $batchMinute = floor(strtotime($row['submitted_at']) / 60);
+        $tsFrom = date('Y-m-d H:i:s', $batchMinute * 60);
+        $tsTo   = date('Y-m-d H:i:s', ($batchMinute + 1) * 60);
+
+        $sibling = $conn->prepare("
+            SELECT id, item_name, reason
+            FROM returns
+            WHERE franchisee_id = ?
+              AND (order_id = ? OR (order_id IS NULL AND ? IS NULL))
+              AND submitted_at >= ? AND submitted_at < ?
+            ORDER BY id ASC
+        ");
+        $sibling->bind_param("iiiss", $row['franchisee_id'], $row['order_id'], $row['order_id'], $tsFrom, $tsTo);
+        $sibling->execute();
+        $siblings = $sibling->get_result()->fetch_all(MYSQLI_ASSOC);
+        $sibling->close();
+
+        $row['batch_items'] = $siblings ?: [['id' => $row['id'], 'item_name' => $row['item_name'], 'reason' => $row['reason']]];
+
+        echo json_encode($row);
         exit();
     }
 
@@ -59,6 +88,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $resolvedAt = in_array($newStatus, ['Approved', 'Rejected', 'Resolved']) ? date('Y-m-d H:i:s') : null;
 
         $notes = $resMethod ? "[$resMethod] $remarks" : $remarks;
+
+        // If GCash/Bank refund and approved, look up the encoder and append forwarding note
+        if ($newStatus === 'Approved' && $resMethod === 'gcash') {
+            // Get the order's assigned encoder for this return
+            $chk = $conn->prepare("
+                SELECT u.full_name, u.email
+                FROM returns r
+                JOIN orders o ON o.id = r.order_id
+                JOIN users  u ON u.user_id = o.assigned_encoder_id
+                WHERE r.id = ? AND o.assigned_encoder_id IS NOT NULL
+            ");
+            $chk->bind_param("i", $id);
+            $chk->execute();
+            $encRow = $chk->get_result()->fetch_assoc();
+            $chk->close();
+            if ($encRow) {
+                $notes .= ' | Forwarded to Encoder: ' . $encRow['full_name'] . ' for GCash/Bank Transfer Refund processing.';
+            }
+        }
 
         $stmt = $conn->prepare("
             UPDATE returns
@@ -92,21 +140,54 @@ $statRejected = $conn->query("SELECT COUNT(*) FROM returns WHERE status = 'Rejec
 $filter = $_GET['status'] ?? '';
 $whereClause = $filter ? "WHERE r.status = '" . $conn->real_escape_string($filter) . "'" : '';
 
-$returns = [];
+// Fetch all return rows
+$rawReturns = [];
 $res = $conn->query("
-    SELECT r.id, r.order_id, r.item_name, r.reason, r.status,
+    SELECT r.id, r.order_id, r.franchisee_id, r.item_name, r.reason, r.status,
            r.submitted_at, r.resolved_at, r.notes,
-           f.branch_name, f.franchisee_name,
+           f.branch_name,
+           COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
            o.po_number
     FROM returns r
-    LEFT JOIN franchisees f ON f.id = r.franchisee_id
-    LEFT JOIN orders      o ON o.id = r.order_id
+    LEFT JOIN franchisees f  ON f.id       = r.franchisee_id
+    LEFT JOIN users      uf  ON uf.user_id = f.user_id
+    LEFT JOIN orders      o  ON o.id       = r.order_id
     $whereClause
     ORDER BY
         CASE r.status WHEN 'Pending' THEN 1 WHEN 'Approved' THEN 2 WHEN 'Resolved' THEN 3 ELSE 4 END,
-        r.submitted_at DESC
+        r.submitted_at DESC,
+        r.franchisee_id ASC,
+        r.order_id ASC
 ");
-while ($row = $res->fetch_assoc()) $returns[] = $row;
+while ($row = $res->fetch_assoc()) $rawReturns[] = $row;
+
+// Group into batches: same franchisee + order + within same minute = one submission
+$batches = [];
+foreach ($rawReturns as $r) {
+    $key = $r['franchisee_id'] . '_' . ($r['order_id'] ?? 'none') . '_' . floor(strtotime($r['submitted_at']) / 60);
+    if (!isset($batches[$key])) {
+        $batches[$key] = [
+            'ids'             => [],
+            'franchisee_name'=> $r['franchisee_name'],
+            'branch_name'    => $r['branch_name'],
+            'po_number'      => $r['po_number'],
+            'submitted_at'   => $r['submitted_at'],
+            'resolved_at'    => $r['resolved_at'],
+            'status'         => $r['status'],
+            'notes'          => $r['notes'],
+            'items'          => [],
+        ];
+    }
+    $batches[$key]['ids'][]   = $r['id'];
+    $batches[$key]['items'][] = ['name' => $r['item_name'], 'reason' => $r['reason']];
+    // Surface the "earliest" status so pending beats resolved
+    $rank = ['Pending'=>0,'Approved'=>1,'Resolved'=>2,'Rejected'=>3];
+    if (($rank[$r['status']] ?? 9) < ($rank[$batches[$key]['status']] ?? 9)) {
+        $batches[$key]['status'] = $r['status'];
+    }
+}
+$batches = array_values($batches);
+$returns = $batches; // keep $returns name for empty check below
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -613,47 +694,57 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
                     <tr>
                         <th>Request ID</th>
                         <th>Franchisee</th>
-                        <th>Item Details</th>
-                        <th>Reason</th>
+                        <th>Items & Reasons</th>
                         <th>PO Number</th>
                         <th>Status</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
-                <?php if (empty($returns)): ?>
-                    <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:3rem;">No return requests found.</td></tr>
-                <?php else: foreach ($returns as $r):
-                    $statusClass = match($r['status']) {
+                <?php if (empty($batches)): ?>
+                    <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:3rem;">No return requests found.</td></tr>
+                <?php else: foreach ($batches as $b):
+                    $firstId     = $b['ids'][0];
+                    $statusClass = match($b['status']) {
                         'Pending'  => 'status-pending',
                         'Approved' => 'status-approved',
                         'Resolved' => 'status-resolved',
                         'Rejected' => 'status-rejected',
                         default    => 'status-pending'
                     };
-                    $statusIcon = match($r['status']) {
+                    $statusIcon = match($b['status']) {
                         'Pending'  => 'clock',
                         'Approved' => 'check-circle',
                         'Resolved' => 'check-check',
                         'Rejected' => 'x-circle',
                         default    => 'clock'
                     };
-                    $actionLabel = in_array($r['status'], ['Pending','Approved']) ? 'Process' : 'View';
-                    $actionIcon  = in_array($r['status'], ['Pending','Approved']) ? 'clipboard-check' : 'eye';
-                    $submittedAt = date('M d, Y', strtotime($r['submitted_at']));
+                    $actionLabel = in_array($b['status'], ['Pending','Approved']) ? 'Process' : 'View';
+                    $actionIcon  = in_array($b['status'], ['Pending','Approved']) ? 'clipboard-check' : 'eye';
                 ?>
-                    <tr data-id="<?= $r['id'] ?>">
-                        <td><strong>#<?= str_pad($r['id'], 4, '0', STR_PAD_LEFT) ?></strong><br>
-                            <small style="color:var(--muted)"><?= $submittedAt ?></small></td>
-                        <td><?= htmlspecialchars($r['branch_name'] ?? '—') ?></td>
-                        <td><?= htmlspecialchars($r['item_name'] ?? '—') ?></td>
-                        <td><?= htmlspecialchars($r['reason'] ?? '—') ?></td>
-                        <td><?= $r['po_number'] ? htmlspecialchars($r['po_number']) : '—' ?></td>
+                    <tr data-id="<?= $firstId ?>">
+                        <td>
+                            <strong>#<?= str_pad($firstId, 4, '0', STR_PAD_LEFT) ?></strong><br>
+                            <small style="color:var(--muted)"><?= date('M d, Y', strtotime($b['submitted_at'])) ?></small>
+                        </td>
+                        <td>
+                            <div style="font-weight:600;"><?= htmlspecialchars($b['franchisee_name'] ?? '—') ?></div>
+                            <div style="font-size:.78rem;color:var(--muted);"><?= htmlspecialchars($b['branch_name'] ?? '') ?></div>
+                        </td>
+                        <td>
+                            <?php foreach ($b['items'] as $item): ?>
+                            <div style="font-size:.85rem;padding:.15rem 0;display:flex;align-items:center;gap:.4rem;">
+                                <span style="font-weight:600;"><?= htmlspecialchars($item['name']) ?></span>
+                                <span style="color:var(--muted);font-size:.75rem;">— <?= htmlspecialchars($item['reason']) ?></span>
+                            </div>
+                            <?php endforeach; ?>
+                        </td>
+                        <td><?= $b['po_number'] ? htmlspecialchars($b['po_number']) : '—' ?></td>
                         <td><span class="status-pill <?= $statusClass ?>">
-                            <i data-lucide="<?= $statusIcon ?>" size="14"></i> <?= $r['status'] ?>
+                            <i data-lucide="<?= $statusIcon ?>" size="14"></i> <?= $b['status'] ?>
                         </span></td>
                         <td>
-                            <button class="btn-action" onclick="openModal(<?= $r['id'] ?>)">
+                            <button class="btn-action" onclick="openModal(<?= $firstId ?>)">
                                 <i data-lucide="<?= $actionIcon ?>" size="16"></i> <?= $actionLabel ?>
                             </button>
                         </td>
@@ -687,8 +778,8 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
                             <div class="field-value" id="modalSubmitted">—</div>
                         </div>
                         <div class="field">
-                            <span class="field-label">Item for Return</span>
-                            <div class="field-value" id="modalItem">—</div>
+                            <span class="field-label">Item(s) for Return</span>
+                            <div id="modalItemsList">—</div>
                         </div>
                         <div class="field">
                             <span class="field-label">PO Number</span>
@@ -697,8 +788,15 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
                     </section>
 
                     <section class="form-section">
-                        <h4 class="section-title"><i data-lucide="info" size="18"></i> Return Reason & Evidence Assessment</h4>
-<div class="field-value reason" id="modalReason">—</div>
+                        <h4 class="section-title"><i data-lucide="image" size="18"></i> Franchisee Receipt Photo</h4>
+                        <div id="modalReceiptWrap" style="display:none;">
+                            <div id="modalReceiptNumber" style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem;"></div>
+                            <img id="modalReceiptImg" src="" alt="Receipt Photo"
+                                style="width:100%;max-height:220px;object-fit:contain;border-radius:10px;border:1px solid var(--card-border);cursor:zoom-in;background:#f9fafb;"
+                                onclick="window.open(this.src,'_blank')">
+                            <div style="font-size:.72rem;color:var(--muted);margin-top:.35rem;">Click image to open full size</div>
+                        </div>
+                        <div id="modalReceiptNone" style="font-size:.85rem;color:var(--muted);font-style:italic;">No receipt photo attached.</div>
                     </section>
 
                     <section class="form-section">
@@ -714,25 +812,54 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
                     </section>
 
                     <section class="resolution-box">
-                        <h4>Fulfillment & Resolution</h4>
-                        
+                        <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:1.5rem;">
+                            <div style="width:32px;height:32px;background:var(--primary);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                                <i data-lucide="clipboard-check" size="16" style="color:white;"></i>
+                            </div>
+                            <h4 style="font-family:'Fraunces',serif;font-size:1.05rem;margin:0;">Fulfillment & Resolution</h4>
+                        </div>
+
                         <label class="field-label">Resolution Method</label>
-                        <select id="resMethod">
-                            <option value="replacement">Product Replacement</option>
-                            <option value="gcash">GCash Refund</option>
-                            <option value="credit">Credit Note (Store Wallet)</option>
-                            <option value="none">Pending Further Info</option>
-                        </select>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:1.25rem;">
+                            <label id="opt-replacement" onclick="selectResMethod('replacement')" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;padding:1rem;border:2px solid var(--primary);border-radius:12px;cursor:pointer;background:rgba(92,64,51,.05);text-align:center;">
+                                <div style="width:36px;height:36px;background:var(--primary);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                                    <i data-lucide="package" size="16" style="color:white;"></i>
+                                </div>
+                                <div>
+                                    <div style="font-weight:700;font-size:.85rem;color:var(--foreground);">Replacement</div>
+                                    <div style="font-size:.72rem;color:var(--muted);">Send new product</div>
+                                </div>
+                            </label>
+                            <label id="opt-gcash" onclick="selectResMethod('gcash')" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;padding:1rem;border:2px solid var(--card-border);border-radius:12px;cursor:pointer;background:white;text-align:center;">
+                                <div style="width:36px;height:36px;background:#eff6ff;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                                    <i data-lucide="banknote" size="16" style="color:#1d4ed8;"></i>
+                                </div>
+                                <div>
+                                    <div style="font-weight:700;font-size:.85rem;color:var(--foreground);">GCash/Bank Refund</div>
+                                    <div style="font-size:.72rem;color:var(--muted);">Transfer refund</div>
+                                </div>
+                            </label>
+                        </div>
+                        <input type="hidden" id="resMethod" value="replacement">
+
+                        <div id="encoderNotice" style="display:none;margin-bottom:1.25rem;background:linear-gradient(135deg,#eff6ff,#dbeafe);border:1.5px solid #93c5fd;border-radius:12px;padding:1rem 1.125rem;">
+                            <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.35rem;">
+                                <i data-lucide="send" size="14" style="color:#1d4ed8;flex-shrink:0;"></i>
+                                <span style="font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:#1d4ed8;">Forwarding to Encoder</span>
+                            </div>
+                            <div style="font-size:.875rem;color:#1e40af;font-weight:600;" id="encoderNameSpan">—</div>
+                            <div style="font-size:.78rem;color:#3b82f6;margin-top:.15rem;">Will process the GCash/Bank Transfer Refund</div>
+                        </div>
 
                         <label class="field-label">Admin Remarks & Instructions</label>
-                        <textarea id="adminRemarks" placeholder="Enter reasoning for decision or specific instructions for fulfillment team..."></textarea>
-                        
-                        <div class="modal-footer" id="modalActionFooter" style="flex-direction:column;gap:0.75rem;">
-                            <button class="btn btn-primary" onclick="handleAction('approve')">
-                                <i data-lucide="check" size="18"></i> Approve & Process
+                        <textarea id="adminRemarks" rows="4" placeholder="Enter your reasoning or specific instructions..." style="resize:none;"></textarea>
+
+                        <div id="modalActionFooter" style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin-top:.25rem;">
+                            <button class="btn btn-primary" onclick="handleAction('approve')" style="justify-content:center;align-items:center;">
+                                <i data-lucide="check-circle" size="16"></i> Approve
                             </button>
-                            <button class="btn btn-outline-error" onclick="handleAction('reject')">
-                                <i data-lucide="x-circle" size="18"></i> Reject Request
+                            <button class="btn btn-outline-error" onclick="handleAction('reject')" style="justify-content:center;align-items:center;">
+                                <i data-lucide="x-circle" size="16"></i> Reject
                             </button>
                         </div>
                     </section>
@@ -744,8 +871,36 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
     <script>
         lucide.createIcons();
 
-        let currentReturnId = null;
-        let currentStatus   = null;
+        let currentReturnId  = null;
+        let currentStatus    = null;
+        let currentEncoderName = null;
+
+        function selectResMethod(val) {
+            document.getElementById('resMethod').value = val;
+            const opts = { replacement: 'opt-replacement', gcash: 'opt-gcash' };
+            Object.entries(opts).forEach(([k, id]) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (k === val) {
+                    el.style.border     = '2px solid var(--primary)';
+                    el.style.background = 'rgba(92,64,51,.05)';
+                } else {
+                    el.style.border     = '2px solid var(--card-border)';
+                    el.style.background = 'white';
+                }
+            });
+            onResMethodChange(val);
+        }
+
+        function onResMethodChange(val) {
+            const notice = document.getElementById('encoderNotice');
+            if (val === 'gcash' && currentEncoderName) {
+                document.getElementById('encoderNameSpan').textContent = currentEncoderName;
+                notice.style.display = 'block';
+            } else {
+                notice.style.display = 'none';
+            }
+        }
 
         // ── Open modal & fetch data ───────────────────────────
         async function openModal(id) {
@@ -754,9 +909,10 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
             document.getElementById('reviewModal').classList.add('active');
 
             // Reset fields
-            ['modalFranchise','modalItem','modalPO','modalSubmitted','modalReason','modalNotes'].forEach(el => {
+            ['modalFranchise','modalPO','modalSubmitted','modalNotes'].forEach(el => {
                 document.getElementById(el).textContent = 'Loading…';
             });
+            document.getElementById('modalItemsList').innerHTML = '<span style="color:var(--muted);">Loading…</span>';
 
             const fd = new FormData();
             fd.append('action', 'get_return');
@@ -771,13 +927,42 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
 
                 const fmtDT = v => v ? new Date(v).toLocaleString('en-US',{month:'short',day:'2-digit',year:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
 
-                document.getElementById('modalSubtitle').textContent    = `#${String(d.id).padStart(4,'0')} • ${d.branch_name ?? '—'}`;
-                document.getElementById('modalFranchise').textContent   = d.branch_name ?? '—';
-                document.getElementById('modalItem').textContent        = d.item_name   ?? '—';
+                document.getElementById('modalSubtitle').textContent    = `#${String(d.id).padStart(4,'0')} • ${d.franchisee_name ?? d.branch_name ?? '—'}`;
+                document.getElementById('modalFranchise').textContent   = (d.franchisee_name ?? '—') + (d.branch_name ? ' — ' + d.branch_name : '');
+
+                // Store encoder for forwarding notice
+                currentEncoderName = d.encoder_name ?? null;
+                document.getElementById('encoderNotice').style.display = 'none';
+                selectResMethod('replacement');
+                // Items list — one row per item with its reason
+                const itemsList = document.getElementById('modalItemsList');
+                if (d.batch_items && d.batch_items.length > 0) {
+                    itemsList.innerHTML = d.batch_items.map((it, i) => `
+                        <div style="display:flex;flex-direction:column;padding:.6rem .75rem;background:#f9fafb;border-radius:8px;border:1px solid var(--card-border);${i > 0 ? 'margin-top:.5rem;' : ''}">
+                            <div style="font-weight:600;font-size:.9rem;">${it.item_name ?? '—'}</div>
+                            <div style="font-size:.78rem;color:var(--muted);margin-top:.2rem;">
+                                <span style="background:#fef3c7;color:#92400e;border-radius:4px;padding:.1rem .4rem;font-weight:600;font-size:.72rem;">${it.reason ?? '—'}</span>
+                            </div>
+                        </div>`).join('');
+                } else {
+                    itemsList.innerHTML = '<span style="color:var(--muted);">—</span>';
+                }
                 document.getElementById('modalPO').textContent          = d.po_number   ?? '—';
                 document.getElementById('modalSubmitted').textContent   = fmtDT(d.submitted_at);
-                document.getElementById('modalReason').textContent      = d.reason      ?? '—';
                 document.getElementById('modalNotes').textContent       = d.notes       || 'No additional notes.';
+
+                // Receipt photo
+                const receiptWrap = document.getElementById('modalReceiptWrap');
+                const receiptNone = document.getElementById('modalReceiptNone');
+                if (d.receipt_photo) {
+                    document.getElementById('modalReceiptImg').src = d.receipt_photo;
+                    document.getElementById('modalReceiptNumber').textContent = d.receipt_number ? 'Receipt #: ' + d.receipt_number : '';
+                    receiptWrap.style.display = 'block';
+                    receiptNone.style.display = 'none';
+                } else {
+                    receiptWrap.style.display = 'none';
+                    receiptNone.style.display = 'block';
+                }
 
                 // Timeline
                 const tl = document.getElementById('modalTimeline');
@@ -797,10 +982,8 @@ while ($row = $res->fetch_assoc()) $returns[] = $row;
 
                 // Show/hide action buttons based on status
                 const footer = document.getElementById('modalActionFooter');
-                if (['Resolved','Rejected'].includes(d.status)) {
-                    footer.style.display = 'none';
-                } else {
-                    footer.style.display = 'flex';
+                if (footer) {
+                    footer.style.display = ['Resolved','Rejected'].includes(d.status) ? 'none' : 'grid';
                 }
 
                 lucide.createIcons();

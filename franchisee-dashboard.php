@@ -129,6 +129,11 @@ function statusClass($step) {
         .summary-card .label{font-size:.9rem;color:var(--muted);margin-bottom:.5rem;font-weight:500;}
         .summary-card .value{font-size:2.25rem;font-weight:700;font-family:'Fraunces',serif;}
         .summary-card .subtext{font-size:.8rem;color:var(--muted);margin-top:.5rem;}
+        .summary-card-link{display:block;text-decoration:none;color:inherit;border-radius:20px;transition:transform .18s,box-shadow .18s;}
+        .summary-card-link:hover{transform:translateY(-4px);box-shadow:0 10px 28px rgba(92,64,51,.13);}
+        .summary-card-link:hover .summary-card{border-color:var(--primary);}
+        .card-arrow{position:absolute;bottom:1.25rem;right:1.75rem;opacity:0;transition:opacity .18s;color:var(--primary);}
+        .summary-card-link:hover .card-arrow{opacity:1;}
         .content-grid{display:grid;grid-template-columns:2fr 1fr;gap:1.5rem;}
         .card{background:white;border:1px solid var(--card-border);border-radius:20px;padding:2rem;}
         .card-header{margin-bottom:1.5rem;}
@@ -159,7 +164,7 @@ function statusClass($step) {
 </head>
 <body>
 <aside>
-    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
+    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchisee Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
     <div class="menu-label">Menu</div>
     <nav>
         <a href="franchisee-dashboard.php" class="nav-item active"><i data-lucide="layout-dashboard"></i> Dashboard</a>
@@ -167,7 +172,7 @@ function statusClass($step) {
         <a href="item-usage.php" class="nav-item"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile">
@@ -191,24 +196,33 @@ function statusClass($step) {
 
     <!-- Summary Stats (from DB) -->
     <div class="summary-grid">
-        <div class="summary-card">
-            <i data-lucide="clock" class="icon-badge"></i>
-            <p class="label">Pending Orders</p>
-            <div class="value"><?php echo $statPending; ?></div>
-            <p class="subtext"><?php echo $statPending > 0 ? 'Under review or processing' : 'No pending orders'; ?></p>
-        </div>
-        <div class="summary-card">
-            <i data-lucide="check-circle" class="icon-badge" style="color:var(--status-pickup-text)"></i>
-            <p class="label">Ready for Pickup</p>
-            <div class="value"><?php echo $statReady; ?></div>
-            <p class="subtext"><?php echo $statReady > 0 ? 'Orders awaiting pickup' : 'None ready yet'; ?></p>
-        </div>
-        <div class="summary-card">
-            <i data-lucide="trending-up" class="icon-badge" style="color:#3b82f6"></i>
-            <p class="label">Total Orders</p>
-            <div class="value"><?php echo $statTotal; ?></div>
-            <p class="subtext">₱<?php echo number_format($totalSpent, 2); ?> total value</p>
-        </div>
+        <a href="order-status.php" class="summary-card-link" title="View Order Status">
+            <div class="summary-card">
+                <i data-lucide="clock" class="icon-badge"></i>
+                <i data-lucide="arrow-right" size="16" class="card-arrow"></i>
+                <p class="label">Pending Orders</p>
+                <div class="value"><?php echo $statPending; ?></div>
+                <p class="subtext"><?php echo $statPending > 0 ? 'Under review or processing' : 'No pending orders'; ?></p>
+            </div>
+        </a>
+        <a href="order-status.php" class="summary-card-link" title="View Order Status">
+            <div class="summary-card">
+                <i data-lucide="check-circle" class="icon-badge" style="color:var(--status-pickup-text)"></i>
+                <i data-lucide="arrow-right" size="16" class="card-arrow"></i>
+                <p class="label">Ready for Pickup</p>
+                <div class="value"><?php echo $statReady; ?></div>
+                <p class="subtext"><?php echo $statReady > 0 ? 'Orders awaiting pickup' : 'None ready yet'; ?></p>
+            </div>
+        </a>
+        <a href="order-history.php" class="summary-card-link" title="View Order History">
+            <div class="summary-card">
+                <i data-lucide="trending-up" class="icon-badge" style="color:#3b82f6"></i>
+                <i data-lucide="arrow-right" size="16" class="card-arrow"></i>
+                <p class="label">Total Orders</p>
+                <div class="value"><?php echo $statTotal; ?></div>
+                <p class="subtext">₱<?php echo number_format($totalSpent, 2); ?> total value</p>
+            </div>
+        </a>
     </div>
 
     <div class="content-grid">

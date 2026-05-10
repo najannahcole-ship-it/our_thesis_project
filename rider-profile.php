@@ -20,19 +20,6 @@ $riderName = $_SESSION['full_name'] ?? 'Delivery Rider';
 // Handle POST: save updated contact number
 $saveMsg = '';
 $saveErr = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $newContact = preg_replace('/\D/', '', $_POST['contact_number'] ?? '');
-    if (strlen($newContact) < 10) {
-        $saveErr = "Please enter a valid contact number.";
-    } else {
-        $upd = $conn->prepare("UPDATE users SET contact_number = ? WHERE user_id = ?");
-        $upd->bind_param("si", $newContact, $riderId);
-        $upd->execute();
-        $upd->close();
-        $saveMsg = "Contact number updated successfully.";
-        $_SESSION['contact_number'] = $newContact;
-    }
-}
 
 // Fetch rider user data
 $stmt = $conn->prepare("SELECT full_name, email, contact_number, status, username FROM users WHERE user_id = ?");
@@ -156,33 +143,29 @@ $riderId_pad   = 'RID-' . str_pad($riderId, 4, '0', STR_PAD_LEFT);
             </div>
 
             <h3 class="section-title">Account Information</h3>
-            <form method="POST" action="rider-profile.php">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" value="<?php echo htmlspecialchars($fullName); ?>" readonly>
-                    </div>
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" value="<?php echo htmlspecialchars($username); ?>" readonly>
-                    </div>
-                    <div class="form-group">
-                        <label>Email Address</label>
-                        <input type="email" value="<?php echo htmlspecialchars($email); ?>" readonly>
-                    </div>
-                    <div class="form-group">
-                        <label>Account Status</label>
-                        <input type="text" value="<?php echo htmlspecialchars($accountStatus); ?>" readonly>
-                    </div>
-                    <div class="form-group" style="grid-column:span 2;">
-                        <label>Contact Number <span style="font-weight:400;color:var(--muted);">(editable)</span></label>
-                        <input type="text" name="contact_number" value="<?php echo htmlspecialchars($contactRaw ?: ''); ?>" placeholder="e.g. 09171234567">
-                    </div>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label>Full Name</label>
+                    <input type="text" value="<?php echo htmlspecialchars($fullName); ?>" readonly>
                 </div>
-                <button type="submit" class="btn-save">
-                    <i data-lucide="save" size="16"></i> Update Contact Number
-                </button>
-            </form>
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" value="<?php echo htmlspecialchars($username); ?>" readonly>
+                </div>
+                <div class="form-group">
+                    <label>Email Address</label>
+                    <input type="email" value="<?php echo htmlspecialchars($email); ?>" readonly>
+                </div>
+                <div class="form-group">
+                    <label>Account Status</label>
+                    <input type="text" value="<?php echo htmlspecialchars($accountStatus); ?>" readonly>
+                </div>
+                <div class="form-group" style="grid-column:span 2;">
+                    <label>Contact Number</label>
+                    <input type="text" value="<?php echo htmlspecialchars($contactRaw ?: '—'); ?>" readonly>
+                    <p style="font-size:.75rem;color:var(--muted);margin-top:.35rem;">Contact changes must be requested through the administrator.</p>
+                </div>
+            </div>
         </div>
 
         <!-- RIGHT: Performance stats -->

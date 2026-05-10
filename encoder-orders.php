@@ -1,4 +1,5 @@
 <?php
+ob_start();
 // ============================================================
 // encoder-orders.php — Order Processing & Verification
 // DB Tables used:
@@ -16,6 +17,22 @@ require_once 'db.php';
 
 $encoderName = $_SESSION['full_name'] ?? 'Data Encoder';
 $encoderId   = $_SESSION['user_id'];
+
+// ── AJAX: Fetch available clerks ─────────────────────────────
+if (isset($_GET['fetch_clerks'])) {
+    error_reporting(0);
+    while (ob_get_level()) ob_end_clean();
+    header('Content-Type: application/json');
+    $clerks = [];
+    $stmt = $conn->query("SELECT user_id AS id, full_name AS name FROM users WHERE role_id = 3 AND status = 'Active' ORDER BY full_name ASC");
+    if ($stmt) { while ($row = $stmt->fetch_assoc()) { $clerks[] = $row; } }
+    else {
+        $stmt2 = $conn->query("SELECT user_id AS id, full_name AS name FROM users WHERE role_id = 3 ORDER BY full_name ASC");
+        if ($stmt2) { while ($row = $stmt2->fetch_assoc()) { $clerks[] = $row; } }
+    }
+    echo json_encode(['success' => true, 'clerks' => $clerks]);
+    $conn->close(); exit();
+}
 
 // ── Handle POST: update order status ─────────────────────────
 $actionMsg = '';
@@ -69,12 +86,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $stepMap = [
             'confirm'    => [2, 'for_payment', 'Order confirmed by encoder. Awaiting payment verification before forwarding to warehouse.'],
-            'processing' => [3, 'Processing',  'Payment verified. Order forwarded to Inventory Clerk for fulfillment.'],
-            'ready'      => [3, 'Processing',  'Order marked as Ready for Fulfillment by encoder. Forwarded to Inventory Clerk.'],
+            'processing' => [3, 'processing',  'Payment verified. Order forwarded to Inventory Clerk for fulfillment.'],
+            'ready'      => [3, 'processing',  'Order marked as Ready for Fulfillment by encoder. Forwarded to Inventory Clerk.'],
             'flag'       => [1, 'Under Review', ''],  // detail built from flag_note below
         ];
 
         // Flag requires a note
+        $blocked = false;
         if ($action === 'flag') {
             $flagNote = trim($_POST['flag_note'] ?? '');
             if (empty($flagNote)) {
@@ -86,15 +104,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // Req 11: Block confirm if no payment method on file
-        $blocked = $blocked ?? false;
-        if ($action === 'confirm') {
+        if ($action === 'confirm' && !$blocked) {
             $chk = $conn->prepare("SELECT payment_method FROM orders WHERE id = ?");
             $chk->bind_param("i", $orderId);
             $chk->execute();
             $chkRow = $chk->get_result()->fetch_assoc();
             $chk->close();
             if (empty($chkRow['payment_method'])) {
-                $actionErr = "Cannot confirm — the franchisee's payment method has not been recorded. Record payment below first.";
+                $actionErr = "Cannot confirm — the franchisee's payment method has not been recorded.";
                 $blocked = true;
             }
         }
@@ -102,9 +119,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$blocked) {
             [$newStep, $newStatus, $histDetail] = $stepMap[$action];
 
-            // Flag: reset encoder/approval so order goes back to franchisee cleanly
             if ($action === 'flag') {
-                $upd = $conn->prepare("UPDATE orders SET status_step = ?, status = ?, assigned_encoder_id = NULL, approved_by = NULL, approved_at = NULL WHERE id = ?");
+                // Keep assigned_encoder_id so order stays in encoder's queue
+                $upd = $conn->prepare("UPDATE orders SET status_step = ?, status = ?, approved_by = NULL, approved_at = NULL WHERE id = ?");
+                $upd->bind_param("isi", $newStep, $newStatus, $orderId);
+            } elseif ($action === 'ready' || $action === 'processing') {
+                // Save assigned clerk if provided
+                $clerkId_assigned = intval($_POST['clerk_id'] ?? 0);
+                if ($clerkId_assigned) {
+                    $cChk = $conn->prepare("SELECT full_name FROM users WHERE user_id = ? AND role_id = 3");
+                    $cChk->bind_param("i", $clerkId_assigned);
+                    $cChk->execute();
+                    $cRow = $cChk->get_result()->fetch_assoc();
+                    $cChk->close();
+                    if ($cRow) { $histDetail .= ' Assigned Clerk: ' . $cRow['full_name'] . '.'; }
+                    $conn->query("UPDATE orders SET assigned_clerk_id = $clerkId_assigned WHERE id = $orderId");
+                }
+                $upd = $conn->prepare("UPDATE orders SET status_step = ?, status = ? WHERE id = ?");
                 $upd->bind_param("isi", $newStep, $newStatus, $orderId);
             } else {
                 $upd = $conn->prepare("UPDATE orders SET status_step = ?, status = ? WHERE id = ?");
@@ -113,9 +144,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $upd->execute();
             $upd->close();
 
+            $statusLabels = [
+                'for_payment' => 'For Payment',
+                'processing'  => 'Processing',
+                'Under Review'=> 'Under Review',
+                'completed'   => 'Completed',
+            ];
+            $histLabel = $statusLabels[$newStatus] ?? $newStatus;
+
             // Log to order_status_history
             $ins = $conn->prepare("INSERT INTO order_status_history (order_id, status_step, status_label, detail, changed_at, changed_by) VALUES (?,?,?,?,NOW(),?)");
-            $ins->bind_param("iissi", $orderId, $newStep, $newStatus, $histDetail, $encoderId);
+            $ins->bind_param("iissi", $orderId, $newStep, $histLabel, $histDetail, $encoderId);
             $ins->execute();
             $ins->close();
 
@@ -135,7 +174,11 @@ $params = [$encoderId];
 $types  = 'i';
 
 if ($filterStep === 'active') {
-    $whereClause .= " AND o.status IN ('Approved','for_payment','Processing')";
+    $whereClause .= " AND o.status IN ('Approved','for_payment','processing','Under Review')";
+} elseif ($filterStep === 'pending') {
+    $whereClause .= " AND o.status_step = 1";
+} elseif ($filterStep === 'today') {
+    $whereClause .= " AND o.status_step >= 2 AND DATE(o.created_at) = CURDATE()";
 } elseif ($filterStep === 'ready') {
     $whereClause .= " AND o.status = 'completed'";
 } elseif ($filterStep === 'completed') {
@@ -361,11 +404,32 @@ function stepClass($s) {
         .er-warn{background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:.875rem 1rem;font-size:.85rem;color:#92400e;margin-bottom:1.25rem;display:flex;gap:.5rem;}
         .er-row{display:flex;justify-content:space-between;padding:.45rem 0;border-bottom:1px dashed var(--card-border);font-size:.9rem;}
         .er-row:last-child{border-bottom:none;}
+        .er-items-table{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:.25rem;}
+        .er-items-table thead tr{background:var(--background);}
+        .er-items-table th{padding:.4rem .6rem;text-align:left;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:700;border-bottom:1px solid var(--card-border);}
+        .er-items-table th:last-child{text-align:right;}
+        .er-items-table td{padding:.45rem .6rem;border-bottom:1px dashed var(--card-border);vertical-align:top;}
+        .er-items-table td:last-child{text-align:right;font-weight:600;}
+        .er-items-table tr:last-child td{border-bottom:none;}
+        .er-stock-ok{font-size:.72rem;color:#166534;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:4px;padding:1px 6px;white-space:nowrap;}
+        .er-stock-low{font-size:.72rem;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:1px 6px;white-space:nowrap;}
+        .er-stock-out{font-size:.72rem;color:#991b1b;background:#fef2f2;border:1px solid #fecaca;border-radius:4px;padding:1px 6px;white-space:nowrap;}
         .er-foot{padding:1rem 2rem 1.5rem;display:flex;gap:.75rem;}
         .er-foot button{flex:1;padding:.875rem;border-radius:12px;font-weight:700;font-family:inherit;font-size:.92rem;cursor:pointer;border:none;}
         .er-back{background:#f3f4f6;color:var(--foreground);}
         .er-confirm{background:var(--primary);color:white;}
         .er-confirm:hover{background:var(--primary-light);}
+        .er-confirm:disabled{opacity:.5;cursor:not-allowed;}
+        /* Clerk assignment panel */
+        .assign-clerk-panel{margin-bottom:1rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:1rem 1.25rem;}
+        .assign-clerk-panel .acp-label{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#166534;margin-bottom:.6rem;display:flex;align-items:center;gap:.4rem;}
+        .clerk-list{display:flex;flex-direction:column;gap:.4rem;max-height:150px;overflow-y:auto;}
+        .clerk-option{display:flex;align-items:center;justify-content:space-between;padding:.5rem .875rem;border-radius:8px;border:1.5px solid #d1fae5;background:white;cursor:pointer;transition:all .15s;}
+        .clerk-option:hover{border-color:#16a34a;background:#f0fdf4;}
+        .clerk-option.selected{border-color:#16a34a;background:#dcfce7;}
+        .clerk-option input[type="radio"]{display:none;}
+        .clerk-name{font-size:.875rem;font-weight:600;color:var(--foreground);}
+        .clerk-list-loading{font-size:.85rem;color:var(--muted);text-align:center;padding:.5rem;}
         /* 2nd authenticator dialog */
         #enc2ndConfirm{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;z-index:300;padding:1rem;}
         #enc2ndConfirm.open{display:flex;}
@@ -585,7 +649,7 @@ function stepClass($s) {
                         </div>
                         <div>
                             <div class="ab-label">Payment Status</div>
-                            <div class="ab-value" style="color:<?php echo strtolower($selectedOrder['payment_status'] ?? '') === 'paid' ? '#166534' : '#b45309'; ?>">
+                            <div class="ab-value" style="color:<?php echo strtolower($selectedOrder['payment_status'] ?? '') === 'paid' ? '#166534' : '#ff0000'; ?>">
                                 <?php echo strtolower($selectedOrder['payment_status'] ?? '') === 'paid' ? '✓ Paid' : '! Unpaid'; ?>
                             </div>
                         </div>
@@ -650,6 +714,7 @@ function stepClass($s) {
                 <?php if ($selectedOrder['status_step'] < 4): ?>
                 <form method="POST" action="encoder-orders.php?po=<?php echo urlencode($selectedOrder['po_number']); ?>&filter=<?php echo $filterStep; ?>">
                     <input type="hidden" name="order_id" value="<?php echo $selectedOrder['id']; ?>">
+                    <input type="hidden" name="clerk_id" id="selectedClerkInput" value="">
                     <div class="action-group"
                          data-po="<?php echo htmlspecialchars($selectedOrder['po_number']); ?>"
                          data-franchisee="<?php echo htmlspecialchars($selectedOrder['franchisee_name'] ?? '—'); ?>"
@@ -657,10 +722,27 @@ function stepClass($s) {
                          data-delivery="<?php echo htmlspecialchars($selectedOrder['delivery_preference']); ?>"
                          data-total="₱<?php echo number_format($selectedOrder['total_amount'], 2); ?>"
                          data-approver="<?php echo htmlspecialchars($selectedOrder['approver_name'] ?? '—'); ?>"
-                         data-items="<?php echo count($selectedItems); ?>">
+                         data-items="<?php echo count($selectedItems); ?>"
+                         data-items-json="<?php echo htmlspecialchars(json_encode(array_map(function($i) {
+                             return [
+                                 'name'      => $i['name'],
+                                 'unit'      => $i['unit'],
+                                 'quantity'  => $i['quantity'],
+                                 'unit_price'=> $i['unit_price'],
+                                 'subtotal'  => $i['subtotal'],
+                                 'stock_qty' => $i['stock_qty'],
+                             ];
+                         }, $selectedItems)), ENT_QUOTES); ?>">
                         <?php
                         $orderStatus = $selectedOrder['status'];
                         ?>
+                        <?php if ($orderStatus === 'Under Review'): ?>
+                        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:.75rem 1rem;font-size:.85rem;color:#92400e;margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem;">
+                            <i data-lucide="refresh-cw" size="15"></i>
+                            <span>Franchisee has resubmitted updated payment details. Please review and confirm.</span>
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="openEncReview('confirm')"><i data-lucide="eye"></i> Review Updated Payment</button>
+                        <?php endif; ?>
                         <?php if ($orderStatus === 'Approved'): ?>
                         <button type="button" class="btn btn-primary" onclick="openEncReview('confirm')"><i data-lucide="eye"></i> Review & Confirm Order</button>
                         <?php endif; ?>
@@ -671,76 +753,21 @@ function stepClass($s) {
                         </div>
                         <button type="button" class="btn btn-success" onclick="openEncReview('ready')"><i data-lucide="package-check"></i> Mark as Ready for Fulfillment</button>
                         <?php endif; ?>
-                        <?php if ($orderStatus === 'Processing'): ?>
+                        <?php if ($orderStatus === 'processing'): ?>
                         <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:.75rem 1rem;font-size:.85rem;color:#166534;display:flex;align-items:center;gap:.5rem;">
                             <i data-lucide="loader" size="15"></i>
                             <span>Order has been forwarded to the Inventory Clerk for fulfillment.</span>
                         </div>
                         <?php endif; ?>
-                        <div class="btn-2col">
-                            <button type="button" class="btn btn-outline" onclick="openEncReview('processing')"><i data-lucide="clock"></i> Set Processing</button>
-                            <button type="button" class="btn btn-danger" onclick="openFlagModal(<?php echo $selectedOrder['id']; ?>, '<?php echo htmlspecialchars(addslashes($selectedOrder['po_number'])); ?>')"><i data-lucide="flag"></i> Flag Issue</button>
+                        <div style="display:flex;">
+                            <button type="button" class="btn btn-danger" style="flex:1;" onclick="openFlagModal(<?php echo $selectedOrder['id']; ?>, '<?php echo htmlspecialchars(addslashes($selectedOrder['po_number'])); ?>')"><i data-lucide="flag"></i> Flag Issue</button>
                         </div>
                     </div>
                 </form>
                 <?php else: ?>
                 <div style="background:#f0fdf4;border-radius:12px;padding:1rem;text-align:center;color:#166534;font-weight:600;">
-                    <i data-lucide="check-circle" size="20" style="display:block;margin:0 auto .5rem;"></i> Order Completed
+                    <i data-lucide="check-circle" size="20" style="display:block;margin:0 auto .5rem;"></i> Successfully Review
                 </div>
-                <?php endif; ?>
-
-                <!-- Mark as Paid form (unpaid non-cash orders only) -->
-                <?php
-                $payStatus = $selectedOrder['payment_status'] ?? 'unpaid';
-                $payMethod = $selectedOrder['payment_method'] ?? null;
-                $isPaid    = strtolower($payStatus) === 'paid';
-                ?>
-                <?php if (!$isPaid && $payMethod !== 'cod'): ?>
-                <form method="POST" action="encoder-orders.php?po=<?php echo urlencode($selectedOrder['po_number']); ?>&filter=<?php echo $filterStep; ?>" class="pay-form" enctype="multipart/form-data" style="margin-top:1.25rem;">
-                    <input type="hidden" name="order_id" value="<?php echo $selectedOrder['id']; ?>">
-                    <input type="hidden" name="po_num" value="<?php echo htmlspecialchars($selectedOrder['po_number']); ?>">
-                    <label><i data-lucide="credit-card" size="12"></i> Confirm Payment</label>
-                    <?php
-                    $pmLabels2  = ['cod' => 'Cash (COD)', 'gcash' => 'GCash', 'bank' => 'Card/Bank'];
-                    $pmDisplay2 = $pmLabels2[$selectedOrder['payment_method'] ?? ''] ?? ($selectedOrder['payment_method'] ?? '');
-                    ?>
-                    <?php if ($selectedOrder['payment_method']): ?>
-                    <div style="background:#e0f2fe;border-radius:8px;padding:.6rem .875rem;font-size:.85rem;margin-bottom:.75rem;color:#0369a1;">
-                        <strong>Franchisee selected:</strong> <?php echo htmlspecialchars($pmDisplay2); ?>
-                    </div>
-                    <?php endif; ?>
-                    <select name="payment_method" required>
-                        <option value="" disabled <?php echo $selectedOrder['payment_method'] ? '' : 'selected'; ?>>Select payment method</option>
-                        <option value="Cash"  <?php echo ($selectedOrder['payment_method']==='cod')   ? 'selected' : ''; ?>>Cash</option>
-                        <option value="GCash" <?php echo ($selectedOrder['payment_method']==='gcash') ? 'selected' : ''; ?>>GCash (Online)</option>
-                        <option value="Card"  <?php echo ($selectedOrder['payment_method']==='bank')  ? 'selected' : ''; ?>>Card Payment</option>
-                    </select>
-                    <input type="text" name="payment_ref"
-                           placeholder="Reference / Transaction No. (optional)"
-                           value="<?php echo htmlspecialchars($selectedOrder['payment_ref'] ?? ''); ?>">
-                    <div class="enc-screenshot-wrap" id="encScreenshotWrap">
-                        <label style="margin-bottom:.4rem;font-size:.72rem;font-weight:700;color:#166534;text-transform:uppercase;letter-spacing:.04em;">
-                            <?php echo !empty($selectedOrder['payment_proof']) ? 'Replace Screenshot (optional)' : 'Upload Payment Screenshot'; ?>
-                        </label>
-                        <?php if (empty($selectedOrder['payment_proof'])): ?>
-                        <p style="font-size:.75rem;color:var(--muted);font-style:italic;margin-bottom:.5rem;">No screenshot uploaded by franchisee.</p>
-                        <?php endif; ?>
-                        <div class="enc-upload-box">
-                            <label for="encPaymentProof">
-                                <span class="eu-icon">📸</span>
-                                <span class="eu-text"><?php echo !empty($selectedOrder['payment_proof']) ? 'Upload / Replace Screenshot' : 'Upload Payment Screenshot'; ?></span>
-                                <span class="eu-sub">JPG, PNG — max 5MB</span>
-                                <input type="file" id="encPaymentProof" name="payment_proof" accept="image/*" onchange="encPreviewScreenshot(this)">
-                            </label>
-                        </div>
-                        <div class="enc-preview" id="encPreviewBox">
-                            <img id="encPreviewImg" src="" alt="Preview">
-                        </div>
-                    </div>
-                    <button type="submit" name="action" value="mark_paid" class="btn-pay">
-                        <i data-lucide="check-circle" size="16"></i> Mark as Paid
-                    </button>
-                </form>
                 <?php endif; ?>
 
                 </div><!-- end vp-details pane -->
@@ -825,6 +852,34 @@ function stepClass($s) {
                 <div class="er-row"><span style="color:var(--muted);">Total Amount</span><span id="er-total" style="font-weight:700;"></span></div>
                 <div class="er-row"><span style="color:var(--muted);">Items Count</span><span id="er-items" style="font-weight:600;"></span></div>
             </div>
+
+            <!-- Ordered items breakdown -->
+            <div style="margin-top:1.25rem;">
+                <div style="font-size:.75rem;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.04em;margin-bottom:.5rem;">Ordered Items</div>
+                <table class="er-items-table" id="er-items-table">
+                    <thead>
+                        <tr>
+                            <th>Item</th>
+                            <th>Qty</th>
+                            <th>Stock</th>
+                            <th>Subtotal</th>
+                        </tr>
+                    </thead>
+                    <tbody id="er-items-body">
+                        <tr><td colspan="4" style="color:var(--muted);font-style:italic;padding:.75rem .6rem;">—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <!-- Clerk assignment — only shown for 'ready' action -->
+            <div class="assign-clerk-panel" id="er-clerk-panel" style="display:none;">
+                <div class="acp-label">
+                    <i data-lucide="user-check" size="13"></i>
+                    Assign Inventory Clerk <span style="color:#dc2626;">*</span>
+                </div>
+                <div class="clerk-list" id="er-clerk-list">
+                    <div class="clerk-list-loading">Loading clerks…</div>
+                </div>
+            </div>
             <div id="er-action-note" style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:.875rem 1rem;font-size:.85rem;color:#166534;"></div>
         </div>
         <div class="er-foot">
@@ -850,25 +905,33 @@ function stepClass($s) {
 </div>
 
 <script>lucide.createIcons();
+    function esc(str) {
+        if (str == null) return '';
+        return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
 
-    let _pendingAction = null; // stores 'confirm' | 'ready' | 'processing'
+    let _pendingAction     = null;
+    let _selectedClerkId   = null;
+    let _selectedClerkName = null;
 
     const actionConfig = {
-        confirm:    { title: 'Review & Confirm Order',           warn: 'You are about to confirm this order and move it to <strong>Processing</strong>. Please verify all details below.', note: 'This will move the order to <strong>Processing</strong> and log the update in order history.', btn: '✓ Confirm & Process', color: '#5c4033' },
-        ready:      { title: 'Mark as Ready for Fulfillment',    warn: 'You are about to mark this order as <strong>Ready for Fulfillment</strong> and forward it to the Inventory Clerk.', note: 'This will move the order to <strong>Ready</strong> status. The Inventory Clerk will deduct warehouse stock.', btn: '✓ Mark Ready', color: '#16a34a' },
-        processing: { title: 'Set Order to Processing',          warn: 'You are about to set this order back to <strong>Processing</strong>.', note: 'This will update the order status to <strong>Processing</strong>.', btn: '✓ Set Processing', color: '#b45309' },
+        confirm:    { title: 'Review & Confirm Order',        warn: 'You are about to confirm this order and move it to <strong>Processing</strong>. Please verify all details below.', note: 'This will move the order to <strong>Processing</strong> and log the update in order history.', btn: '✓ Confirm & Process', color: '#5c4033' },
+        ready:      { title: 'Mark as Ready for Fulfillment', warn: 'You are about to mark this order as <strong>Ready for Fulfillment</strong> and forward it to the Inventory Clerk.', note: 'This will move the order to <strong>Ready</strong> status. The Inventory Clerk will deduct warehouse stock.', btn: '✓ Mark Ready', color: '#16a34a' },
+        processing: { title: 'Set Order to Processing',       warn: 'You are about to set this order back to <strong>Processing</strong>.', note: 'This will update the order status to <strong>Processing</strong>.', btn: '✓ Set Processing', color: '#b45309' },
     };
 
     const second2Config = {
-        confirm:    { title: 'Confirm this order?',              body: 'This will move the order to Processing status. The Inventory Clerk will be notified.', warn: 'This action will be logged under your account.' },
-        ready:      { title: 'Mark as Ready for Fulfillment?',   body: 'This forwards the order to the Inventory Clerk for stock deduction. Once done, stock levels will be updated.', warn: '⚠ This cannot be undone. The order will proceed to the Inventory Clerk immediately.' },
-        processing: { title: 'Set to Processing?',               body: 'This updates the order status to Processing.', warn: 'This action will be logged under your account.' },
+        confirm:    { title: 'Confirm this order?',             body: 'This will move the order to Processing status.', warn: 'This action will be logged under your account.' },
+        ready:      { title: 'Mark as Ready for Fulfillment?',  body: 'This forwards the order to the Inventory Clerk for stock deduction.', warn: '⚠ This cannot be undone. The order will proceed to the Inventory Clerk immediately.' },
+        processing: { title: 'Set to Processing?',              body: 'This updates the order status to Processing.', warn: 'This action will be logged under your account.' },
     };
 
     function openEncReview(action) {
-        _pendingAction = action;
-        const cfg  = actionConfig[action];
-        const ag   = document.querySelector('.action-group[data-po]');
+        _pendingAction     = action;
+        _selectedClerkId   = null;
+        _selectedClerkName = null;
+        const cfg = actionConfig[action];
+        const ag  = document.querySelector('.action-group[data-po]');
         if (!ag) return;
 
         document.getElementById('er-modal-title').textContent = cfg.title;
@@ -885,14 +948,88 @@ function stepClass($s) {
         document.getElementById('er-total').textContent      = ag.dataset.total     || '—';
         document.getElementById('er-items').textContent      = (ag.dataset.items || '0') + ' item(s)';
 
+        // Populate items table
+        const itemsBody = document.getElementById('er-items-body');
+        try {
+            const items = JSON.parse(ag.dataset.itemsJson || '[]');
+            if (items.length) {
+                itemsBody.innerHTML = items.map(it => {
+                    const stockQty = parseInt(it.stock_qty) || 0;
+                    const qty      = parseFloat(it.quantity) || 0;
+                    let stockBadge;
+                    if (stockQty <= 0)        stockBadge = `<span class="er-stock-out">Out of Stock</span>`;
+                    else if (stockQty < qty*2) stockBadge = `<span class="er-stock-low">Low (${stockQty})</span>`;
+                    else                       stockBadge = `<span class="er-stock-ok">In Stock (${stockQty})</span>`;
+                    return `<tr>
+                        <td><strong>${esc(it.name)}</strong> <span style="color:var(--muted);font-size:.78rem;">(${esc(it.unit)})</span></td>
+                        <td>${qty} × ₱${parseFloat(it.unit_price).toFixed(2)}</td>
+                        <td>${stockBadge}</td>
+                        <td>₱${parseFloat(it.subtotal).toFixed(2)}</td>
+                    </tr>`;
+                }).join('');
+            } else {
+                itemsBody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);font-style:italic;padding:.75rem .6rem;">No items found.</td></tr>';
+            }
+        } catch(e) {
+            itemsBody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);font-style:italic;">—</td></tr>';
+        }
+
+        // Show clerk panel only for ready action
+        const clerkPanel = document.getElementById('er-clerk-panel');
+        if (action === 'ready') {
+            clerkPanel.style.display = 'block';
+            fetchClerks();
+        } else {
+            clerkPanel.style.display = 'none';
+        }
+
         document.getElementById('encReviewModal').classList.add('open');
         lucide.createIcons();
 
-        // Wire confirm button → close 1st modal, open 2nd authenticator
         document.getElementById('er-submit-btn').onclick = function() {
+            if (action === 'ready' && !_selectedClerkId) {
+                clerkPanel.style.border = '1.5px solid #dc2626';
+                setTimeout(() => clerkPanel.style.border = '1px solid #bbf7d0', 2000);
+                return;
+            }
             closeEncReview();
             open2ndConfirm(action, ag.dataset.po);
         };
+    }
+
+    function fetchClerks() {
+        fetch('fetch-clerks.php')
+            .then(r => r.text())
+            .then(text => {
+                const list = document.getElementById('er-clerk-list');
+                try {
+                    const data = JSON.parse(text);
+                    if (!data.clerks || !data.clerks.length) {
+                        list.innerHTML = '<div class="clerk-list-loading">No active inventory clerks found.</div>';
+                        return;
+                    }
+                    list.innerHTML = data.clerks.map(c => `
+                        <label class="clerk-option" onclick="selectClerk(${c.id}, '${c.name.replace(/'/g,"\\'")}', this)">
+                            <input type="radio" name="clerk_pick" value="${c.id}">
+                            <span class="clerk-name">${c.name}</span>
+                            <span style="font-size:.75rem;color:#166534;font-weight:600;">Available</span>
+                        </label>`).join('');
+                    lucide.createIcons();
+                } catch(e) {
+                    console.error('fetchClerks raw response:', text);
+                    list.innerHTML = '<div class="clerk-list-loading" style="color:#dc2626;">Could not load clerks.</div>';
+                }
+            })
+            .catch(() => {
+                document.getElementById('er-clerk-list').innerHTML = '<div class="clerk-list-loading" style="color:#dc2626;">Network error loading clerks.</div>';
+            });
+    }
+
+    function selectClerk(id, name, el) {
+        document.querySelectorAll('#er-clerk-list .clerk-option').forEach(o => o.classList.remove('selected'));
+        el.classList.add('selected');
+        _selectedClerkId   = id;
+        _selectedClerkName = name;
     }
 
     function closeEncReview() {
@@ -920,13 +1057,15 @@ function stepClass($s) {
     }
 
     function submitEncoderAction(action) {
-        // Find the action form (not the pay form) and submit with the right action value
         const form = document.querySelector('form[method="POST"] .action-group')?.closest('form');
         if (!form) return;
-        const btn  = document.createElement('button');
-        btn.name   = 'action';
-        btn.value  = action;
-        btn.type   = 'submit';
+        // Write selected clerk to hidden input
+        const clerkInput = document.getElementById('selectedClerkInput');
+        if (clerkInput && _selectedClerkId) clerkInput.value = _selectedClerkId;
+        const btn = document.createElement('button');
+        btn.name  = 'action';
+        btn.value = action;
+        btn.type  = 'submit';
         btn.style.display = 'none';
         form.appendChild(btn);
         btn.click();

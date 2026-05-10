@@ -51,12 +51,14 @@ for ($i = $trendDays - 1; $i >= 0; $i--) {
     $trendLabels[] = date('M d', strtotime("-$i days"));
 }
 
-// Inflow per day
+// Inflow per day (use created_at — arrival_date can be NULL)
 $inflowMap = [];
-$sql = "SELECT DATE(arrival_date) AS d, SUM(quantity) AS total
-        FROM stock_receipts
-        WHERE DATE(arrival_date) BETWEEN ? AND ?
-        GROUP BY DATE(arrival_date)";
+$catJoin = $catParam !== '' ? "JOIN products p ON p.id = sr.product_id AND p.category = '$catParam'" : '';
+$sql = "SELECT DATE(sr.created_at) AS d, SUM(sr.quantity) AS total
+        FROM stock_receipts sr
+        $catJoin
+        WHERE DATE(sr.created_at) BETWEEN ? AND ?
+        GROUP BY DATE(sr.created_at)";
 $stmt = $conn->prepare($sql);
 $stmt->bind_param("ss", $dateFrom, $dateTo);
 $stmt->execute();
@@ -66,10 +68,12 @@ $stmt->close();
 
 // Outflow per day
 $outflowMap = [];
-$sql = "SELECT DATE(adjusted_at) AS d, SUM(quantity) AS total
-        FROM stock_adjustments
-        WHERE DATE(adjusted_at) BETWEEN ? AND ?
-        GROUP BY DATE(adjusted_at)";
+$catJoin2 = $catParam !== '' ? "JOIN products p ON p.id = sa.product_id AND p.category = '$catParam'" : '';
+$sql = "SELECT DATE(sa.adjusted_at) AS d, SUM(sa.quantity) AS total
+        FROM stock_adjustments sa
+        $catJoin2
+        WHERE DATE(sa.adjusted_at) BETWEEN ? AND ?
+        GROUP BY DATE(sa.adjusted_at)";
 $stmt = $conn->prepare($sql);
 $stmt->bind_param("ss", $dateFrom, $dateTo);
 $stmt->execute();
@@ -83,51 +87,38 @@ for ($i = $trendDays - 1; $i >= 0; $i--) {
     $trendOutflow[] = $outflowMap[$d] ?? 0;
 }
 
-// ── Category distribution: total stock_qty per category ─────
-$catLabels = [];
-$catData   = [];
-$res = $conn->query("
-    SELECT category, SUM(stock_qty) AS total
-    FROM products
-    WHERE status = 'available'
-    GROUP BY category
-    ORDER BY total DESC
-");
-while ($r = $res->fetch_assoc()) {
-    $catLabels[] = $r['category'];
-    $catData[]   = (int)$r['total'];
-}
-
 // ── Item Movement Details table ──────────────────────────────
-// For each product: stock_in (receipts), stock_out (adjustments), closing = current stock_qty
+// stock_in  = receipts (created_at)
+// stock_out = inventory_logs action='deduct' by clerk (role_id=3)
+// total_adj = stock_adjustments
 $movementSQL = "
     SELECT p.id, p.name, p.category, p.unit, p.stock_qty AS closing_stock,
-           COALESCE(si.total_in, 0)   AS stock_in,
-           COALESCE(so.total_out, 0)  AS stock_out,
-           COALESCE(adj.total_adj, 0) AS total_adj
+           COALESCE(si.total_in,  0) AS stock_in,
+           COALESCE(so.total_out, 0) AS stock_out,
+           COALESCE(aj.total_adj, 0) AS total_adj
     FROM products p
     LEFT JOIN (
         SELECT product_id, SUM(quantity) AS total_in
         FROM stock_receipts
-        WHERE DATE(arrival_date) BETWEEN ? AND ?
+        WHERE DATE(created_at) BETWEEN ? AND ?
         GROUP BY product_id
-    ) si  ON si.product_id  = p.id
+    ) si ON si.product_id = p.id
     LEFT JOIN (
         SELECT product_id, SUM(quantity) AS total_out
-        FROM stock_adjustments
-        WHERE DATE(adjusted_at) BETWEEN ? AND ?
+        FROM inventory_logs
+        WHERE action = 'deduct'
+          AND DATE(created_at) BETWEEN ? AND ?
         GROUP BY product_id
-    ) so  ON so.product_id  = p.id
+    ) so ON so.product_id = p.id
     LEFT JOIN (
         SELECT product_id, SUM(quantity) AS total_adj
         FROM stock_adjustments
         WHERE DATE(adjusted_at) BETWEEN ? AND ?
         GROUP BY product_id
-    ) adj ON adj.product_id = p.id
+    ) aj ON aj.product_id = p.id
     WHERE p.status = 'available'
     $catClause
-    HAVING (stock_in > 0 OR stock_out > 0 OR total_adj > 0 OR 1=1)
-    ORDER BY (stock_in + stock_out) DESC
+    ORDER BY (COALESCE(si.total_in,0) + COALESCE(so.total_out,0)) DESC, p.name ASC
     LIMIT 50
 ";
 
@@ -146,16 +137,15 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     header('Content-Type: text/csv');
     header('Content-Disposition: attachment; filename="inventory_report_' . $dateTo . '.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['Item Name', 'Category', 'Unit', 'Stock In', 'Stock Out', 'Adjustments', 'Closing Stock']);
+    fputcsv($out, ['Item Name', 'Category', 'Unit', 'Stock In', 'Stock Out (Logs)', 'Current Stock']);
     foreach ($movementRows as $row) {
         fputcsv($out, [
             $row['name'],
             $row['category'],
             $row['unit'],
-            $row['stock_in'],
-            $row['stock_out'],
-            $row['total_adj'],
-            $row['closing_stock'],
+            (int)$row['stock_in'],
+            (int)$row['stock_out'],
+            (int)$row['closing_stock'],
         ]);
     }
     fclose($out);
@@ -184,6 +174,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             --primary-light: #8b5e3c;
             --accent: #d25424;
             --muted: #8c837d;
+            --success: #059669;
+            --error: #dc2626;
             --status-review-bg: #fffbeb;
             --status-review-text: #b45309;
             --status-pickup-bg: #f0fdf4;
@@ -330,7 +322,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         /* Report Controls */
         .report-controls {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(3, 1fr);
             gap: 1rem;
             background: white;
             padding: 1.5rem;
@@ -347,24 +339,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             border: 1px solid var(--card-border);
             font-family: inherit;
         }
-        .btn-generate {
-            background: var(--primary);
-            color: white;
-            border: none;
-            padding: 0.75rem;
-            border-radius: 10px;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-        }
-
         /* Dashboard Grid */
         .dashboard-grid {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: 1fr;
             gap: 1.5rem;
             margin-bottom: 2rem;
         }
@@ -472,25 +450,13 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                 <label>Period</label>
                 <input type="text" value="<?= htmlspecialchars($dateFrom) ?> → <?= $dateTo ?>" readonly style="background:#faf9f8;color:var(--muted);">
             </div>
-            <button type="submit" class="btn-generate" data-testid="button-generate-report">
-                <i data-lucide="refresh-cw" size="18"></i> Generate Report
-            </button>
         </form>
 
         <div class="dashboard-grid">
             <div class="card" data-testid="card-movement-chart">
-                <div class="card-title">
-                    Stock Movement Trend
-                    <span style="font-size: 0.8rem; color: var(--muted); font-family: 'DM Sans';">Daily volume in kg/units</span>
-                </div>
+                <div class="card-title">Stock Movement Trend</div>
                 <div class="chart-container">
                     <canvas id="movementChart"></canvas>
-                </div>
-            </div>
-            <div class="card" data-testid="card-category-distribution">
-                <div class="card-title">Stock by Category</div>
-                <div class="chart-container">
-                    <canvas id="categoryChart"></canvas>
                 </div>
             </div>
 
@@ -505,26 +471,23 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                             <th>Item Name</th>
                             <th>Stock In</th>
                             <th>Stock Out (Issues)</th>
-                            <th>Adjustments</th>
                             <th>Current Stock</th>
                         </tr>
                     </thead>
                     <tbody>
                     <?php if (empty($movementRows)): ?>
-                        <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:2rem;">No movement data found for this period.</td></tr>
+                        <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:2rem;">No movement data found for this period.</td></tr>
                     <?php else: foreach ($movementRows as $row):
-                        $stockIn  = (float)$row['stock_in'];
-                        $stockOut = (float)$row['stock_out'];
-                        $adj      = (float)$row['total_adj'];
-                        $closing  = (float)$row['closing_stock'];
+                        $stockIn  = (int)$row['stock_in'];
+                        $stockOut = (int)$row['stock_out'];
+                        $closing  = (int)$row['closing_stock'];
                         $unit     = htmlspecialchars($row['unit']);
                     ?>
                         <tr>
                             <td><strong><?= htmlspecialchars($row['name']) ?></strong><br><small style="color:var(--muted)"><?= htmlspecialchars($row['category']) ?></small></td>
-                            <td><?= $stockIn > 0 ? '+'.number_format($stockIn,1).' '.$unit : '—' ?></td>
-                            <td><?= $stockOut > 0 ? '−'.number_format($stockOut,1).' '.$unit : '—' ?></td>
-                            <td><?= $adj > 0 ? '−'.number_format($adj,1).' '.$unit : '—' ?></td>
-                            <td><strong><?= number_format($closing,0).' '.$unit ?></strong></td>
+                            <td class="trend-up"><?= $stockIn > 0 ? '+' . $stockIn . ' ' . $unit : '—' ?></td>
+                            <td class="trend-down"><?= $stockOut > 0 ? '−' . $stockOut . ' ' . $unit : '—' ?></td>
+                            <td><strong><?= $closing . ' ' . $unit ?></strong></td>
                         </tr>
                     <?php endforeach; endif; ?>
                     </tbody>
@@ -536,76 +499,54 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     <script>
         lucide.createIcons();
 
-        // ── Stock Movement Trend (real data from PHP) ──
         const trendLabels  = <?= json_encode($trendLabels) ?>;
         const trendInflow  = <?= json_encode($trendInflow) ?>;
         const trendOutflow = <?= json_encode($trendOutflow) ?>;
-
-        // Downsample labels if > 30 days to avoid clutter
-        function downsample(labels, data, maxPoints) {
-            if (labels.length <= maxPoints) return { labels, data };
-            const step = Math.ceil(labels.length / maxPoints);
-            return {
-                labels: labels.filter((_, i) => i % step === 0),
-                data:   data.filter((_, i)   => i % step === 0)
-            };
-        }
-        const ds = downsample(trendLabels, trendInflow, 20);
-        const ds2 = downsample(trendLabels, trendOutflow, 20);
 
         const ctxMovement = document.getElementById('movementChart').getContext('2d');
         new Chart(ctxMovement, {
             type: 'line',
             data: {
-                labels: ds.labels,
+                labels: trendLabels,
                 datasets: [{
                     label: 'Stock In',
-                    data: ds.data,
+                    data: trendInflow,
                     borderColor: '#059669',
                     backgroundColor: 'rgba(5, 150, 105, 0.1)',
                     fill: true,
-                    tension: 0.4,
-                    pointRadius: 3
+                    tension: 0.3,
+                    pointRadius: trendLabels.length <= 30 ? 3 : 1,
+                    pointHoverRadius: 5,
                 }, {
                     label: 'Adjustments Out',
-                    data: ds2.data,
+                    data: trendOutflow,
                     borderColor: '#d25424',
                     backgroundColor: 'rgba(210, 84, 36, 0.1)',
                     fill: true,
-                    tension: 0.4,
-                    pointRadius: 3
+                    tension: 0.3,
+                    pointRadius: trendLabels.length <= 30 ? 3 : 1,
+                    pointHoverRadius: 5,
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { position: 'bottom' } },
-                scales: { y: { beginAtZero: true } }
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'bottom' },
+                    tooltip: {
+                        callbacks: {
+                            label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y}`
+                        }
+                    }
+                },
+                scales: {
+                    x: { ticks: { maxTicksLimit: 10, maxRotation: 0 } },
+                    y: { beginAtZero: true, ticks: { precision: 0 } }
+                }
             }
         });
 
-        // ── Category Distribution (real data from PHP) ──
-        const catLabels = <?= json_encode($catLabels) ?>;
-        const catData   = <?= json_encode($catData) ?>;
-        const catColors = ['#382c24','#d25424','#8b5e3c','#8c837d','#5c4033','#b45309','#059669','#0ea5e9','#7c3aed','#db2777'];
-
-        const ctxCategory = document.getElementById('categoryChart').getContext('2d');
-        new Chart(ctxCategory, {
-            type: 'doughnut',
-            data: {
-                labels: catLabels,
-                datasets: [{
-                    data: catData,
-                    backgroundColor: catColors.slice(0, catLabels.length),
-                    borderWidth: 0
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: { legend: { position: 'bottom' } }
-            }
-        });
     </script>
 </body>
 </html>

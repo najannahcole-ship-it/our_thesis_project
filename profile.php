@@ -148,7 +148,7 @@ $spentDisplay = $totalSpent >= 1000000
 </head>
 <body>
 <aside>
-    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
+    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
     <div class="menu-label">Menu</div>
     <nav>
         <a href="franchisee-dashboard.php" class="nav-item"><i data-lucide="layout-dashboard"></i> Dashboard</a>
@@ -156,7 +156,7 @@ $spentDisplay = $totalSpent >= 1000000
         <a href="item-usage.php" class="nav-item"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item active"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile">

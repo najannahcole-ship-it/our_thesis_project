@@ -14,77 +14,149 @@ header("Pragma: no-cache");
 
 require_once __DIR__ . '/db.php';
 
+// Auto-add missing columns to inventory_batches if not yet present
+$conn->query("ALTER TABLE `inventory_batches` ADD COLUMN IF NOT EXISTS `expiry_date` DATE NULL");
+$conn->query("ALTER TABLE `inventory_batches` ADD COLUMN IF NOT EXISTS `received_date` DATE NULL");
+$conn->query("ALTER TABLE `inventory_batches` ADD COLUMN IF NOT EXISTS `batch_number` VARCHAR(100) NULL");
+$conn->query("ALTER TABLE `inventory_batches` ADD COLUMN IF NOT EXISTS `remaining_qty` DECIMAL(10,2) NOT NULL DEFAULT 0.00");
+$conn->query("ALTER TABLE `inventory_batches` ADD COLUMN IF NOT EXISTS `batch_qty` DECIMAL(10,2) NOT NULL DEFAULT 0.00");
+
 $clerkName   = $_SESSION['full_name'] ?? 'Inventory Clerk';
 $clerkUserId = $_SESSION['user_id'];
 
-// ── Stat: Orders awaiting fulfillment
-$pendingFulfillment = $conn->query("
-    SELECT COUNT(*) FROM orders WHERE status IN ('Approved','Processing')
-")->fetch_row()[0];
+// ── AJAX: stat card detail modals ────────────────────────────
+if (isset($_GET['ajax'])) {
+    header('Content-Type: application/json');
+    switch ($_GET['ajax']) {
 
-// ── Stat: Low stock (stock_qty <= 10)
-$lowStockCount = $conn->query("
-    SELECT COUNT(*) FROM products WHERE status = 'available' AND stock_qty <= 10
-")->fetch_row()[0];
+        case 'low_stock':
+            $rows = [];
+            $r = $conn->query("
+                SELECT name, category, stock_qty, unit, low_stock_threshold
+                FROM products
+                WHERE status = 'available' AND stock_qty <= low_stock_threshold
+                ORDER BY stock_qty ASC
+            ");
+            if ($r) while ($row = $r->fetch_assoc()) $rows[] = $row;
+            echo json_encode($rows); break;
 
-// ── Stat: Stock units received today
-$receivedToday = $conn->query("
-    SELECT COALESCE(SUM(quantity), 0) FROM stock_receipts WHERE DATE(arrival_date) = CURDATE()
-")->fetch_row()[0];
+        case 'received_today':
+            $rows = [];
+            $r = $conn->query("
+                SELECT p.name AS product_name, p.unit,
+                       sr.quantity, sr.batch_number, sr.created_at,
+                       u.full_name AS clerk_name
+                FROM stock_receipts sr
+                LEFT JOIN products p ON p.id = sr.product_id
+                LEFT JOIN users    u ON u.user_id = sr.recorded_by
+                WHERE DATE(sr.created_at) = CURDATE()
+                ORDER BY sr.created_at DESC
+            ");
+            if ($r) while ($row = $r->fetch_assoc()) $rows[] = $row;
+            echo json_encode($rows); break;
+
+        case 'adjustments':
+            $rows = [];
+            $r = $conn->query("
+                SELECT p.name AS product_name, p.unit,
+                       sa.adj_type, sa.quantity, sa.reason_code, sa.notes, sa.adjusted_at,
+                       u.full_name AS clerk_name
+                FROM stock_adjustments sa
+                LEFT JOIN products p ON p.id = sa.product_id
+                LEFT JOIN users    u ON u.user_id = sa.adjusted_by
+                WHERE MONTH(sa.adjusted_at) = MONTH(CURDATE()) AND YEAR(sa.adjusted_at) = YEAR(CURDATE())
+                ORDER BY sa.adjusted_at DESC
+            ");
+            if ($r) while ($row = $r->fetch_assoc()) $rows[] = $row;
+            echo json_encode($rows); break;
+
+        case 'expiring':
+            $rows = [];
+            $r = $conn->query("
+                SELECT p.name AS product_name, p.unit,
+                       ib.batch_number, ib.remaining_qty, ib.expiry_date,
+                       DATEDIFF(ib.expiry_date, CURDATE()) AS days_left
+                FROM inventory_batches ib
+                LEFT JOIN products p ON p.id = ib.product_id
+                WHERE ib.remaining_qty > 0
+                  AND ib.expiry_date IS NOT NULL
+                  AND ib.expiry_date >= CURDATE()
+                  AND ib.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+                ORDER BY ib.expiry_date ASC
+            ");
+            if ($r) while ($row = $r->fetch_assoc()) $rows[] = $row;
+            echo json_encode($rows); break;
+
+        default:
+            echo json_encode([]);
+    }
+    $conn->close(); exit();
+}
+
+// ── Stat: Orders awaiting clerk action (Processing=2, Ready=3)
+$res = $conn->query("SELECT COUNT(*) FROM orders WHERE status_step IN (1, 2, 3)");
+$pendingFulfillment = $res ? $res->fetch_row()[0] : 0;
+
+// ── Stat: Low stock (stock_qty <= low_stock_threshold per product)
+$res = $conn->query("SELECT COUNT(*) FROM products WHERE status = 'available' AND stock_qty <= low_stock_threshold");
+$lowStockCount = $res ? $res->fetch_row()[0] : 0;
+
+// ── Stat: Stock units received today (use created_at, arrival_date may be NULL)
+$res = $conn->query("SELECT COALESCE(SUM(quantity), 0) FROM stock_receipts WHERE DATE(created_at) = CURDATE()");
+$receivedToday = $res ? (int)$res->fetch_row()[0] : 0;
 
 // ── Stat: Adjustments logged this month
-$adjustmentsMonth = $conn->query("
-    SELECT COUNT(*) FROM stock_adjustments
-    WHERE MONTH(adjusted_at) = MONTH(CURDATE()) AND YEAR(adjusted_at) = YEAR(CURDATE())
-")->fetch_row()[0];
+$res = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE MONTH(adjusted_at) = MONTH(CURDATE()) AND YEAR(adjusted_at) = YEAR(CURDATE())");
+$adjustmentsMonth = $res ? $res->fetch_row()[0] : 0;
 
-// ── Stat: Products expiring within 7 days
-$expiringSoon = $conn->query("
-    SELECT COUNT(DISTINCT product_id) FROM stock_receipts
-    WHERE expiry_date IS NOT NULL AND expiry_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)
-")->fetch_row()[0];
+// ── Stat: Products expiring within 7 days (from inventory_batches — proper expiry table)
+$res = $conn->query("SELECT COUNT(DISTINCT product_id) FROM inventory_batches WHERE remaining_qty > 0 AND expiry_date IS NOT NULL AND expiry_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)");
+$expiringSoon = $res ? $res->fetch_row()[0] : 0;
 
-// ── Recent inventory changes: receipts + adjustments combined, latest 8
+// ── Recent inventory changes: inventory_logs (clerk actions only) + adjustments, latest 8
 $recentChanges = [];
 $res = $conn->query("
-    SELECT 'receipt' AS source_type, p.name AS product_name, r.quantity, p.unit,
-           r.arrival_date AS changed_at, u.full_name AS clerk_name, NULL AS reason_code
-    FROM stock_receipts r
-    LEFT JOIN products p ON p.id = r.product_id
-    LEFT JOIN users    u ON u.user_id = r.recorded_by
+    SELECT 'receipt' AS source_type, p.name AS product_name, il.quantity, p.unit,
+           il.created_at AS changed_at, u.full_name AS clerk_name, il.remarks AS reason_code
+    FROM inventory_logs il
+    LEFT JOIN products p ON p.id = il.product_id
+    LEFT JOIN users    u ON u.user_id = il.created_by
+    WHERE il.action = 'add' AND u.role_id = 3
     UNION ALL
-    SELECT 'adjustment', p.name, a.quantity, p.unit,
-           a.adjusted_at, u.full_name, a.reason_code
-    FROM stock_adjustments a
-    LEFT JOIN products p ON p.id = a.product_id
-    LEFT JOIN users    u ON u.user_id = a.adjusted_by
+    SELECT 'adjustment', p.name, sa.quantity, p.unit,
+           sa.adjusted_at, u.full_name, sa.reason_code
+    FROM stock_adjustments sa
+    LEFT JOIN products p ON p.id = sa.product_id
+    LEFT JOIN users    u ON u.user_id = sa.adjusted_by
+    WHERE u.role_id = 3
     ORDER BY changed_at DESC
     LIMIT 8
 ");
-while ($row = $res->fetch_assoc()) $recentChanges[] = $row;
+if ($res) while ($row = $res->fetch_assoc()) $recentChanges[] = $row;
 
-// ── Critical low stock alerts (<=10)
+// ── Critical low stock alerts (per product threshold)
 $criticalStock = [];
 $res = $conn->query("
-    SELECT name, stock_qty, unit FROM products
-    WHERE status = 'available' AND stock_qty <= 10
+    SELECT name, stock_qty, unit, low_stock_threshold FROM products
+    WHERE status = 'available' AND stock_qty <= low_stock_threshold
     ORDER BY stock_qty ASC LIMIT 4
 ");
-while ($row = $res->fetch_assoc()) $criticalStock[] = $row;
+if ($res) while ($row = $res->fetch_assoc()) $criticalStock[] = $row;
 
-// ── Expiry alerts: expiring within 30 days
+// ── Expiry alerts: batches expiring within 30 days with remaining qty
 $expiryAlerts = [];
 $res = $conn->query("
-    SELECT p.name AS product_name, r.expiry_date, r.batch_number,
-           DATEDIFF(r.expiry_date, CURDATE()) AS days_left
-    FROM stock_receipts r
-    LEFT JOIN products p ON p.id = r.product_id
-    WHERE r.expiry_date IS NOT NULL
-      AND r.expiry_date >= CURDATE()
-      AND r.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
-    ORDER BY r.expiry_date ASC LIMIT 4
+    SELECT p.name AS product_name, ib.expiry_date, ib.batch_number,
+           DATEDIFF(ib.expiry_date, CURDATE()) AS days_left
+    FROM inventory_batches ib
+    LEFT JOIN products p ON p.id = ib.product_id
+    WHERE ib.remaining_qty > 0
+      AND ib.expiry_date IS NOT NULL
+      AND ib.expiry_date >= CURDATE()
+      AND ib.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+    ORDER BY ib.expiry_date ASC LIMIT 4
 ");
-while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
+if ($res) while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -107,6 +179,10 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
             --primary-light: #8b5e3c;
             --accent: #d25424;
             --muted: #8c837d;
+            --success: #059669;
+            --warning: #d97706;
+            --danger: #dc2626;
+            --info: #3b82f6;
             --status-review-bg: #fffbeb;
             --status-review-text: #b45309;
             --status-pickup-bg: #f0fdf4;
@@ -284,7 +360,7 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
         /* Summary Cards */
         .summary-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 1.5rem;
             margin-bottom: 2.5rem;
         }
@@ -294,6 +370,12 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
             padding: 1.75rem;
             border-radius: 20px;
             position: relative;
+            cursor: pointer;
+            transition: box-shadow 0.2s, transform 0.2s;
+        }
+        .summary-card:hover {
+            box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+            transform: translateY(-2px);
         }
         .summary-card .icon-badge {
             position: absolute;
@@ -362,6 +444,21 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
         .badge-out { background: rgba(239, 68, 68, 0.1); color: var(--danger); }
         .badge-adj { background: rgba(59, 130, 246, 0.1); color: var(--info); }
 
+        /* Modal */
+        .modal-overlay { position:fixed; inset:0; background:rgba(45,36,30,.55); backdrop-filter:blur(4px); display:none; align-items:center; justify-content:center; z-index:200; }
+        .modal-overlay.open { display:flex; }
+        .modal-box { background:white; border-radius:24px; width:100%; max-width:620px; max-height:82vh; display:flex; flex-direction:column; padding:2.5rem; box-shadow:0 20px 50px rgba(0,0,0,.12); }
+        .modal-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; flex-shrink:0; }
+        .modal-head h3 { font-family:'Fraunces',serif; font-size:1.3rem; }
+        .modal-close { background:none; border:none; cursor:pointer; color:var(--muted); width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; }
+        .modal-close:hover { background:var(--background); }
+        .modal-body { overflow-y:auto; flex:1; }
+        .modal-table { width:100%; border-collapse:collapse; font-size:.875rem; }
+        .modal-table th { padding:.6rem 1rem; background:var(--background); text-align:left; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+        .modal-table td { padding:.8rem 1rem; border-bottom:1px solid var(--card-border); vertical-align:middle; }
+        .modal-table tr:last-child td { border-bottom:none; }
+        .modal-empty { text-align:center; color:var(--muted); padding:2.5rem; font-size:.9rem; }
+
         @media (max-width: 1200px) {
             .summary-grid { grid-template-columns: repeat(2, 1fr); }
             .content-grid { grid-template-columns: 1fr; }
@@ -407,7 +504,6 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
             </div>
             <div style="text-align: right;">
                 <p id="current-date" style="font-weight: 600; color: var(--primary)"></p>
-                <p style="font-size: 0.85rem; color: var(--muted)">Shift: Morning (06:00 - 14:00)</p>
             </div>
         </div>
 
@@ -436,25 +532,25 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
         </div>
 
         <div class="summary-grid">
-            <div class="summary-card" data-testid="card-pending-fulfillment" style="cursor:pointer;" onclick="window.location='clerk-orders.php'">
-                <i data-lucide="clipboard-list" class="icon-badge" style="color: var(--primary)"></i>
-                <p class="label">Awaiting Fulfillment</p>
-                <div class="value" data-testid="text-pending-fulfillment"><?= $pendingFulfillment ?></div>
-                <p class="subtext">Orders to process</p>
-            </div>
-            <div class="summary-card" data-testid="card-low-stock-alerts">
+            <div class="summary-card" data-testid="card-low-stock-alerts" onclick="openModal('low_stock','Low Stock Alerts')">
                 <i data-lucide="alert-triangle" class="icon-badge" style="color: var(--danger)"></i>
                 <p class="label">Low Stock Alerts</p>
                 <div class="value" data-testid="text-low-stock-count"><?= $lowStockCount ?></div>
                 <p class="subtext">Items below threshold</p>
             </div>
-            <div class="summary-card" data-testid="card-received-today">
+            <div class="summary-card" data-testid="card-received-today" onclick="openModal('received_today','Received Today')">
                 <i data-lucide="package-check" class="icon-badge" style="color: var(--success)"></i>
                 <p class="label">Received Today</p>
                 <div class="value" data-testid="text-received-count"><?= number_format($receivedToday, 0) ?></div>
                 <p class="subtext">Stock units logged</p>
             </div>
-            <div class="summary-card" data-testid="card-expiring-soon">
+            <div class="summary-card" data-testid="card-pending-adjustments" onclick="openModal('adjustments','Adjustments This Month')">
+                <i data-lucide="git-pull-request" class="icon-badge" style="color: var(--warning)"></i>
+                <p class="label">Adjustments</p>
+                <div class="value" data-testid="text-pending-adj"><?= $adjustmentsMonth ?></div>
+                <p class="subtext">This month</p>
+            </div>
+            <div class="summary-card" data-testid="card-expiring-soon" onclick="openModal('expiring','Expiring Within 7 Days')">
                 <i data-lucide="calendar-x" class="icon-badge" style="color: var(--accent)"></i>
                 <p class="label">Expiring Soon</p>
                 <div class="value" data-testid="text-expiring-count"><?= $expiringSoon ?></div>
@@ -486,7 +582,7 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
                             $badgeClass = $isReceipt ? 'badge-in' : 'badge-adj';
                             $badgeLabel = $isReceipt ? 'Stock In' : 'Adjustment';
                             $sign       = $isReceipt ? '+' : '−';
-                            $qty        = number_format($row['quantity'] + 0, 2);
+                            $qty        = (int)$row['quantity'];
                             $unit       = htmlspecialchars($row['unit'] ?? '');
                             $clerk      = htmlspecialchars($row['clerk_name'] ?? '—');
                             $ts         = strtotime($row['changed_at']);
@@ -518,7 +614,7 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
                     <div class="alert-item alert-critical">
                         <div class="alert-info">
                             <h4><?= htmlspecialchars($item['name']) ?></h4>
-                            <p>Critical Low Stock</p>
+                            <p>Below threshold (<?= $item['low_stock_threshold'] ?>)</p>
                         </div>
                         <div class="stock-level">
                             <span style="color: var(--danger);"><?= $item['stock_qty'] . ' ' . htmlspecialchars($item['unit']) ?></span>
@@ -549,14 +645,124 @@ while ($row = $res->fetch_assoc()) $expiryAlerts[] = $row;
         </div>
     </main>
 
+<!-- Stat Detail Modal -->
+<div id="statModal" class="modal-overlay">
+    <div class="modal-box">
+        <div class="modal-head">
+            <h3 id="modalTitle">Details</h3>
+            <button class="modal-close" id="modalCloseBtn"><i data-lucide="x" style="width:18px;height:18px;"></i></button>
+        </div>
+        <div class="modal-body" id="modalBody">
+            <p class="modal-empty">Loading…</p>
+        </div>
+    </div>
+</div>
+
     <script>
         lucide.createIcons();
-        document.getElementById('current-date').textContent = new Date().toLocaleDateString('en-US', { 
-            weekday: 'long', 
-            year: 'numeric', 
-            month: 'long', 
-            day: 'numeric' 
+        document.getElementById('current-date').textContent = new Date().toLocaleDateString('en-US', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
         });
+
+        // ── Modal ──────────────────────────────────────────────
+        function closeModal() {
+            document.getElementById('statModal').classList.remove('open');
+        }
+        document.getElementById('modalCloseBtn').addEventListener('click', closeModal);
+        document.getElementById('statModal').addEventListener('click', function(e) {
+            if (e.target === this) closeModal();
+        });
+
+        function esc(s) {
+            return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+        function fmtDate(d) {
+            if (!d) return '—';
+            return new Date(d).toLocaleDateString('en-PH', {month:'short', day:'numeric', year:'numeric'});
+        }
+        function fmtDT(d) {
+            if (!d) return '—';
+            return new Date(d).toLocaleString('en-PH', {month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit'});
+        }
+
+        async function openModal(type, title) {
+            document.getElementById('modalTitle').textContent = title;
+            document.getElementById('modalBody').innerHTML = '<p class="modal-empty">Loading…</p>';
+            document.getElementById('statModal').classList.add('open');
+
+            try {
+                const data = await fetch('clerk-dashboard.php?ajax=' + type).then(r => r.json());
+
+                if (!data.length) {
+                    document.getElementById('modalBody').innerHTML = '<p class="modal-empty">No records found.</p>';
+                    return;
+                }
+
+                let html = '';
+
+                if (type === 'low_stock') {
+                    html = '<table class="modal-table"><thead><tr><th>Product</th><th>Category</th><th>Stock</th><th>Threshold</th></tr></thead><tbody>';
+                    html += data.map(r => `<tr>
+                        <td style="font-weight:600;">${esc(r.name)}</td>
+                        <td style="color:var(--muted);">${esc(r.category)}</td>
+                        <td style="color:var(--danger);font-weight:700;">${r.stock_qty} ${esc(r.unit)}</td>
+                        <td style="color:var(--muted);">${r.low_stock_threshold}</td>
+                    </tr>`).join('');
+                    html += '</tbody></table>';
+
+                } else if (type === 'received_today') {
+                    html = '<table class="modal-table"><thead><tr><th>Product</th><th>Batch #</th><th>Qty</th><th>Recorded By</th><th>Time</th></tr></thead><tbody>';
+                    html += data.map(r => `<tr>
+                        <td style="font-weight:600;">${esc(r.product_name)}</td>
+                        <td style="font-family:monospace;font-size:.82rem;">${esc(r.batch_number)}</td>
+                        <td style="font-weight:700;color:var(--success);">+${parseInt(r.quantity)} ${esc(r.unit)}</td>
+                        <td style="color:var(--muted);">${esc(r.clerk_name ?? '—')}</td>
+                        <td style="color:var(--muted);font-size:.82rem;">${fmtDT(r.created_at)}</td>
+                    </tr>`).join('');
+                    html += '</tbody></table>';
+
+                } else if (type === 'adjustments') {
+                    html = '<table class="modal-table"><thead><tr><th>Product</th><th>Type</th><th>Qty</th><th>Reason</th><th>By</th><th>Date</th></tr></thead><tbody>';
+                    html += data.map(r => {
+                        const isAdd = r.adj_type === 'add';
+                        const color = isAdd ? 'var(--success)' : 'var(--danger)';
+                        const sign  = isAdd ? '+' : '−';
+                        const badge = isAdd
+                            ? '<span style="background:#ecfdf5;color:#059669;padding:.15rem .55rem;border-radius:99px;font-size:.72rem;font-weight:700;">Add</span>'
+                            : '<span style="background:#fef2f2;color:#dc2626;padding:.15rem .55rem;border-radius:99px;font-size:.72rem;font-weight:700;">Subtract</span>';
+                        return `<tr>
+                            <td style="font-weight:600;">${esc(r.product_name)}</td>
+                            <td>${badge}</td>
+                            <td style="font-weight:700;color:${color};">${sign}${parseInt(r.quantity)} ${esc(r.unit)}</td>
+                            <td style="color:var(--muted);font-size:.82rem;">${esc(r.reason_code ?? '—')}</td>
+                            <td style="color:var(--muted);">${esc(r.clerk_name ?? '—')}</td>
+                            <td style="color:var(--muted);font-size:.82rem;">${fmtDate(r.adjusted_at)}</td>
+                        </tr>`;
+                    }).join('');
+                    html += '</tbody></table>';
+
+                } else if (type === 'expiring') {
+                    html = '<table class="modal-table"><thead><tr><th>Product</th><th>Batch #</th><th>Remaining</th><th>Expiry Date</th><th>Days Left</th></tr></thead><tbody>';
+                    html += data.map(r => {
+                        const urgent = r.days_left <= 3;
+                        const color  = urgent ? 'var(--danger)' : 'var(--warning)';
+                        return `<tr>
+                            <td style="font-weight:600;">${esc(r.product_name)}</td>
+                            <td style="font-family:monospace;font-size:.82rem;">${esc(r.batch_number)}</td>
+                            <td>${parseInt(r.remaining_qty)} ${esc(r.unit)}</td>
+                            <td style="color:${color};font-weight:700;">${fmtDate(r.expiry_date)}</td>
+                            <td style="color:${color};font-weight:700;">${r.days_left} day${r.days_left != 1 ? 's' : ''}</td>
+                        </tr>`;
+                    }).join('');
+                    html += '</tbody></table>';
+                }
+
+                document.getElementById('modalBody').innerHTML = html;
+                lucide.createIcons();
+            } catch(e) {
+                document.getElementById('modalBody').innerHTML = '<p class="modal-empty" style="color:var(--danger);">Failed to load data.</p>';
+            }
+        }
     </script>
 </body>
 </html>

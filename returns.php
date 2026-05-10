@@ -7,6 +7,11 @@
 //   READ  → products    (populate item dropdown)
 //   READ  → returns     (show this franchisee's return history)
 //   WRITE → returns     (save new return request on submit)
+//
+// New columns expected in `returns` table:
+//   receipt_number  VARCHAR(100) NULL
+//   receipt_photo   VARCHAR(255) NULL   (file path on server)
+// NOTE: Returns are NEVER written to item_usage — separate records.
 // ============================================================
 session_start();
 if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 2) { header('Location: index.php'); exit(); }
@@ -23,6 +28,30 @@ $fullName = $_SESSION['full_name'] ?? 'Franchisee';
 // Get franchisee record
 $franchisee   = getFranchiseeByUser($conn, $userId);
 $franchiseeId = $franchisee['id'] ?? null;
+
+// ── AJAX: fetch items for a specific order ────────────────────
+if (isset($_GET['fetch_order_items']) && $franchiseeId) {
+    header('Content-Type: application/json');
+    $orderId = intval($_GET['order_id'] ?? 0);
+    $items   = [];
+    if ($orderId) {
+        $stmt = $conn->prepare("
+            SELECT p.name, p.unit
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = ?
+              AND oi.order_id IN (SELECT id FROM orders WHERE franchisee_id = ?)
+            ORDER BY p.name ASC
+        ");
+        $stmt->bind_param("ii", $orderId, $franchiseeId);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        while ($row = $res->fetch_assoc()) { $items[] = $row; }
+        $stmt->close();
+    }
+    echo json_encode(['success' => true, 'items' => $items]);
+    $conn->close(); exit();
+}
 
 // Fetch this franchisee's orders for the "Order Reference" dropdown
 $franchiseeOrders = [];
@@ -49,23 +78,70 @@ $submitMsg = '';
 $submitErr = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $franchiseeId) {
-    $orderId   = intval($_POST['order_id']   ?? 0) ?: null;
-    $itemName  = trim($_POST['item_name']    ?? '');
-    $reason    = trim($_POST['reason']       ?? '');
-    $notes     = trim($_POST['notes']        ?? '');
+    $orderId       = intval($_POST['order_id']       ?? 0) ?: null;
+    $receiptNumber = trim($_POST['receipt_number']   ?? '');
 
-    if (empty($itemName) || empty($reason)) {
-        $submitErr = "Please select an item and a reason before submitting.";
+    $itemNames = $_POST['item_name'] ?? [];
+    $reasons   = $_POST['reason']    ?? [];
+    $notes     = trim($_POST['notes'] ?? '');
+
+    $itemNames = array_filter(array_map('trim', $itemNames));
+
+    // ── Validate: receipt photo is required ───────────────────
+    $receiptPhotoPath = null;
+    if (empty($_FILES['receipt_photo']['name'])) {
+        $submitErr = "An order receipt photo is required. Please attach a photo before submitting.";
     } else {
+        // Handle file upload
+        $uploadDir  = 'uploads/return_receipts/';
+        if (!is_dir($uploadDir)) { mkdir($uploadDir, 0755, true); }
+        $ext        = strtolower(pathinfo($_FILES['receipt_photo']['name'], PATHINFO_EXTENSION));
+        $allowed    = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf'];
+        if (!in_array($ext, $allowed)) {
+            $submitErr = "Invalid file type. Please upload a JPG, PNG, GIF, WEBP, or PDF.";
+        } elseif ($_FILES['receipt_photo']['size'] > 10 * 1024 * 1024) {
+            $submitErr = "File is too large. Maximum size is 10 MB.";
+        } else {
+            $safeFile = uniqid('receipt_', true) . '.' . $ext;
+            if (!move_uploaded_file($_FILES['receipt_photo']['tmp_name'], $uploadDir . $safeFile)) {
+                $submitErr = "Failed to save the receipt photo. Please try again.";
+            } else {
+                $receiptPhotoPath = $uploadDir . $safeFile;
+            }
+        }
+    }
+
+    if (!$submitErr && empty($itemNames)) {
+        $submitErr = "Please add at least one item to return.";
+    }
+
+    // ── Save to `returns` table ONLY — never to item_usage ───
+    if (!$submitErr) {
         $ins = $conn->prepare("
             INSERT INTO returns
-                (order_id, franchisee_id, item_name, reason, notes, status, submitted_at)
-            VALUES (?, ?, ?, ?, ?, 'Pending', NOW())
+                (order_id, franchisee_id, item_name, reason, notes,
+                 receipt_number, receipt_photo, status, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', NOW())
         ");
-        $ins->bind_param("iisss", $orderId, $franchiseeId, $itemName, $reason, $notes);
-        $ins->execute();
+        $count = 0;
+        foreach ($itemNames as $idx => $itemName) {
+            $reason = trim($reasons[$idx] ?? '');
+            if (empty($itemName) || empty($reason)) continue;
+            $ins->bind_param("iisssss",
+                $orderId, $franchiseeId, $itemName, $reason, $notes,
+                $receiptNumber, $receiptPhotoPath
+            );
+            $ins->execute();
+            $count++;
+        }
         $ins->close();
-        $submitMsg = "Return request submitted successfully. Our team will review it shortly.";
+        if ($count > 0) {
+            $submitMsg = $count === 1
+                ? "Return request submitted successfully. Our team will review it shortly."
+                : "$count return items submitted successfully. Our team will review them shortly.";
+        } else {
+            $submitErr = "Please fill in all item and reason fields.";
+        }
     }
 }
 
@@ -74,6 +150,7 @@ $returnHistory = [];
 if ($franchiseeId) {
     $stmt = $conn->prepare("
         SELECT r.id, r.item_name, r.reason, r.notes, r.status, r.submitted_at, r.resolved_at,
+               r.receipt_number, r.receipt_photo,
                o.po_number
         FROM returns r
         LEFT JOIN orders o ON o.id = r.order_id
@@ -166,11 +243,18 @@ $conn->close();
         .btn-submit-modal{width:100%;background:var(--primary);color:white;border:none;padding:1rem;border-radius:12px;font-weight:700;cursor:pointer;margin-top:.5rem;font-family:inherit;font-size:.95rem;transition:background .2s;}
         .btn-submit-modal:hover{background:var(--primary-light);}
         .ret-id{font-weight:700;color:var(--primary);}
+        /* Receipt photo upload */
+        .file-upload-area{border:2px dashed var(--card-border);border-radius:12px;padding:1.25rem;text-align:center;cursor:pointer;transition:border-color .2s;background:#fdfaf7;position:relative;min-height:90px;}
+        .file-upload-area:hover,.file-upload-area.has-file{border-color:var(--primary);}
+        .file-upload-area input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;z-index:2;}
+        .file-upload-area .upload-label{font-size:.88rem;color:var(--muted);pointer-events:none;}
+        .file-upload-area .upload-label strong{color:var(--primary);}
+        .receipt-required-note{font-size:.78rem;color:#ef4444;margin-top:.35rem;text-align:center;}
     </style>
 </head>
 <body>
 <aside>
-    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
+    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
     <div class="menu-label">Menu</div>
     <nav>
         <a href="franchisee-dashboard.php" class="nav-item"><i data-lucide="layout-dashboard"></i> Dashboard</a>
@@ -178,7 +262,7 @@ $conn->close();
         <a href="item-usage.php" class="nav-item"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item active"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile">
@@ -239,6 +323,7 @@ $conn->close();
                     <th>Item</th>
                     <th>Reason</th>
                     <th>Linked Order</th>
+                    <th>Receipt</th>
                     <th>Date Submitted</th>
                     <th>Status</th>
                 </tr>
@@ -260,6 +345,20 @@ $conn->close();
                             <span style="color:var(--muted);">—</span>
                         <?php endif; ?>
                     </td>
+                    <td>
+                        <?php if (!empty($ret['receipt_photo'])): ?>
+                            <button type="button" onclick="viewPhoto('<?php echo htmlspecialchars($ret['receipt_photo']); ?>', '<?php echo htmlspecialchars($ret['receipt_number'] ?? ''); ?>')"
+                                style="background:none;border:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:.3rem;color:var(--primary);font-size:.82rem;font-weight:600;">
+                                <img src="<?php echo htmlspecialchars($ret['receipt_photo']); ?>" alt="receipt"
+                                    style="width:38px;height:38px;object-fit:cover;border-radius:6px;border:1px solid var(--card-border);">
+                                <span><?php echo htmlspecialchars($ret['receipt_number'] ?: 'View'); ?></span>
+                            </button>
+                        <?php elseif (!empty($ret['receipt_number'])): ?>
+                            <span style="font-size:.82rem;color:var(--muted);"><?php echo htmlspecialchars($ret['receipt_number']); ?></span>
+                        <?php else: ?>
+                            <span style="color:var(--muted);">—</span>
+                        <?php endif; ?>
+                    </td>
                     <td style="color:var(--muted);font-size:.88rem;"><?php echo date('M d, Y h:i A', strtotime($ret['submitted_at'])); ?></td>
                     <td><span class="pill <?php echo $statusClass; ?>"><?php echo htmlspecialchars($ret['status']); ?></span></td>
                 </tr>
@@ -269,6 +368,20 @@ $conn->close();
     </div>
     <?php endif; ?>
 </main>
+
+<!-- Photo Lightbox -->
+<div id="photoLightbox" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:500;align-items:center;justify-content:center;padding:1rem;" onclick="if(event.target===this)closeLightbox()">
+    <div style="background:white;border-radius:16px;max-width:560px;width:100%;overflow:hidden;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:1rem 1.25rem;border-bottom:1px solid #eee;">
+            <div>
+                <div style="font-weight:700;font-size:.95rem;">Receipt Photo</div>
+                <div id="lightboxRef" style="font-size:.8rem;color:#6b7280;margin-top:.1rem;"></div>
+            </div>
+            <button onclick="closeLightbox()" style="background:none;border:none;cursor:pointer;color:#6b7280;font-size:1.25rem;">✕</button>
+        </div>
+        <img id="lightboxImg" src="" alt="Receipt" style="width:100%;max-height:70vh;object-fit:contain;">
+    </div>
+</div>
 
 <!-- New Return Request Modal — form POSTs to this same page -->
 <div class="modal-overlay" id="returnModal">
@@ -280,11 +393,11 @@ $conn->close();
             </button>
         </div>
 
-        <form method="POST" action="returns.php">
+        <form method="POST" action="returns.php" enctype="multipart/form-data">
             <!-- Order Reference (from this franchisee's real orders) -->
             <div class="form-group">
-                <label>Order Reference <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
-                <select name="order_id">
+                <label>Order Reference <span style="font-weight:400;color:var(--muted);"></span></label>
+                <select name="order_id" id="orderRefSelect" onchange="loadOrderItems(this.value)">
                     <option value="">— No specific order —</option>
                     <?php foreach ($franchiseeOrders as $o): ?>
                     <option value="<?php echo $o['id']; ?>">
@@ -294,37 +407,63 @@ $conn->close();
                 </select>
             </div>
 
-            <!-- Item to Return (from real products table) -->
+            <!-- Receipt Number -->
             <div class="form-group">
-                <label>Item to Return <span style="color:#ef4444;">*</span></label>
-                <select name="item_name" required>
-                    <option value="" disabled selected>Select an item</option>
-                    <?php
-                    $lastCat2 = '';
-                    foreach ($products as $p):
-                        if ($p['category'] !== $lastCat2):
-                            if ($lastCat2 !== '') echo '</optgroup>';
-                            echo '<optgroup label="' . htmlspecialchars($p['category']) . '">';
-                            $lastCat2 = $p['category'];
-                        endif;
-                    ?>
-                    <option value="<?php echo htmlspecialchars($p['name']); ?>">
-                        <?php echo htmlspecialchars($p['name']); ?>
-                    </option>
-                    <?php endforeach; if ($lastCat2 !== '') echo '</optgroup>'; ?>
-                </select>
+                <label for="receiptNumberInput">Receipt Number <span style="font-weight:400;color:var(--muted);">(from your order receipt)</span></label>
+                <input type="text" id="receiptNumberInput" name="receipt_number"
+                       placeholder="e.g. OR-2024-00123"
+                       value="<?php echo htmlspecialchars($_POST['receipt_number'] ?? ''); ?>">
             </div>
 
-            <!-- Reason -->
+            <!-- Order Receipt Photo (required) -->
             <div class="form-group">
-                <label>Reason for Return <span style="color:#ef4444;">*</span></label>
-                <select name="reason" required>
-                    <option value="" disabled selected>Select a reason</option>
-                    <option value="Damaged">Damaged Packaging</option>
-                    <option value="Expired">Near Expiry / Expired</option>
-                    <option value="Wrong Item">Incorrect Item Delivered</option>
-                    <option value="Quality">Quality Issues</option>
-                </select>
+                <label>Order Receipt Photo <span style="color:#ef4444;">*</span></label>
+                <div class="file-upload-area" id="uploadArea">
+                    <input type="file" name="receipt_photo" id="receiptPhotoInput"
+                           accept="image/*,.pdf" required onchange="handleFileSelect(this)">
+                    <!-- Default prompt (hidden once photo is chosen) -->
+                    <div class="upload-label" id="uploadLabel">
+                        <i data-lucide="upload-cloud" size="28" style="display:block;margin:0 auto .5rem;opacity:.5;"></i>
+                        <strong>Click to upload</strong> or drag &amp; drop<br>
+                        <span style="font-size:.78rem;">JPG, PNG, GIF, WEBP, PDF — max 10 MB</span>
+                    </div>
+                    <!-- Image preview (shown once photo is chosen) -->
+                    <div id="imgPreviewWrap" style="display:none;pointer-events:none;">
+                        <img id="imgPreview" src="" alt="Receipt preview"
+                            style="max-width:100%;max-height:220px;object-fit:contain;border-radius:8px;display:block;margin:0 auto;">
+                        <div id="imgPreviewName" style="font-size:.8rem;color:var(--primary);font-weight:600;margin-top:.5rem;text-align:center;"></div>
+                    </div>
+                </div>
+                <!-- Remove photo button (shown once photo is chosen) -->
+                <button type="button" id="removePhotoBtn" onclick="removePhoto()"
+                    style="display:none;margin-top:.5rem;width:100%;padding:.45rem;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:8px;font-size:.82rem;font-weight:700;cursor:pointer;font-family:inherit;">
+                    🗑 Remove Photo
+                </button>
+                <p class="receipt-required-note">A photo or scan of the order receipt is required to submit a return.</p>
+            </div>
+
+            <!-- Items to Return — dynamic rows -->
+            <div class="form-group">
+                <label>Items to Return <span style="color:#ef4444;">*</span></label>
+                <div id="itemRowsContainer">
+                    <!-- First row (always shown) -->
+                    <div class="item-row" style="display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;align-items:center;margin-bottom:.5rem;">
+                        <select name="item_name[]" class="item-select" required style="margin:0;">
+                            <option value="" disabled selected>Select an item</option>
+                        </select>
+                        <select name="reason[]" required style="margin:0;">
+                            <option value="" disabled selected>Reason</option>
+                            <option value="Damaged">Damaged Packaging</option>
+                            <option value="Expired">Near Expiry / Expired</option>
+                            <option value="Wrong Item">Incorrect Item Delivered</option>
+                            <option value="Quality">Quality Issues</option>
+                        </select>
+                        <button type="button" onclick="removeItemRow(this)" style="width:34px;height:34px;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:8px;cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;" title="Remove">✕</button>
+                    </div>
+                </div>
+                <button type="button" id="addItemBtn" onclick="addItemRow()" style="margin-top:.4rem;width:100%;padding:.6rem;border:1.5px dashed var(--card-border);border-radius:10px;background:transparent;color:var(--primary);font-weight:600;font-family:inherit;font-size:.88rem;cursor:pointer;">
+                    + Add Another Item
+                </button>
             </div>
 
             <!-- Additional Notes -->
@@ -343,11 +482,195 @@ $conn->close();
 <!-- Close modal when clicking backdrop -->
 <script>
     lucide.createIcons();
+
+    // ── Receipt photo: image preview ──────────────────────────
+    function handleFileSelect(input) {
+        const area       = document.getElementById('uploadArea');
+        const label      = document.getElementById('uploadLabel');
+        const previewWrap= document.getElementById('imgPreviewWrap');
+        const previewImg = document.getElementById('imgPreview');
+        const previewName= document.getElementById('imgPreviewName');
+        const removeBtn  = document.getElementById('removePhotoBtn');
+
+        if (!input.files || !input.files[0]) {
+            resetUpload();
+            return;
+        }
+
+        const f   = input.files[0];
+        const ext = f.name.split('.').pop().toLowerCase();
+
+        previewName.textContent = f.name + ' (' + (f.size / 1024).toFixed(1) + ' KB)';
+        area.classList.add('has-file');
+        removeBtn.style.display = 'block';
+        label.style.display = 'none';
+        previewWrap.style.display = 'block';
+
+        if (ext === 'pdf') {
+            // PDF: show icon instead of image
+            previewImg.src = '';
+            previewImg.style.display = 'none';
+            previewWrap.querySelector('div') || previewWrap.insertAdjacentHTML('afterbegin',
+                '<div id="pdfIcon" style="font-size:2.5rem;text-align:center;padding:.5rem;">📄</div>');
+        } else {
+            previewImg.style.display = 'block';
+            const reader = new FileReader();
+            reader.onload = e => { previewImg.src = e.target.result; };
+            reader.readAsDataURL(f);
+        }
+    }
+
+    function removePhoto() {
+        document.getElementById('receiptPhotoInput').value = '';
+        resetUpload();
+    }
+
+    function resetUpload() {
+        document.getElementById('uploadArea').classList.remove('has-file');
+        document.getElementById('uploadLabel').style.display = 'block';
+        document.getElementById('imgPreviewWrap').style.display = 'none';
+        document.getElementById('imgPreview').src = '';
+        document.getElementById('imgPreviewName').textContent = '';
+        document.getElementById('removePhotoBtn').style.display = 'none';
+    }
+
+    // ── Client-side: block submission if no photo attached ────
+    document.querySelector('form').addEventListener('submit', function(e) {
+        const photoInput = document.getElementById('receiptPhotoInput');
+        if (!photoInput.files || !photoInput.files[0]) {
+            e.preventDefault();
+            alert('Please attach an order receipt photo before submitting.');
+            photoInput.closest('.form-group').scrollIntoView({behavior:'smooth', block:'center'});
+        }
+    });
+
+    let _orderItems = []; // cached items for current order
+
+    function updateAddBtn() {
+        const btn  = document.getElementById('addItemBtn');
+        if (!btn) return;
+        const rows = document.querySelectorAll('#itemRowsContainer .item-row').length;
+        // Hide if only 1 item available OR all items already added
+        if (_orderItems.length <= 1 || rows >= _orderItems.length) {
+            btn.style.display = 'none';
+        } else {
+            btn.style.display = 'block';
+        }
+    }
+
+    function loadOrderItems(orderId) {
+        const container = document.getElementById('itemRowsContainer');
+        if (!orderId) {
+            _orderItems = [];
+            container.querySelectorAll('.item-select').forEach(sel => {
+                sel.innerHTML = '<option value="" disabled selected>Select an item</option>';
+            });
+            updateAddBtn();
+            return;
+        }
+        container.querySelectorAll('.item-select').forEach(sel => {
+            sel.innerHTML = '<option value="" disabled selected>Loading…</option>';
+        });
+        fetch('returns.php?fetch_order_items=1&order_id=' + orderId)
+            .then(r => r.json())
+            .then(data => {
+                _orderItems = data.items || [];
+                container.querySelectorAll('.item-select').forEach(sel => {
+                    populateItemSelect(sel);
+                });
+                updateAddBtn();
+            })
+            .catch(() => {
+                container.querySelectorAll('.item-select').forEach(sel => {
+                    sel.innerHTML = '<option value="" disabled selected>Failed to load items</option>';
+                });
+                updateAddBtn();
+            });
+    }
+
+    function updateAllItemSelects() {
+        const rows    = document.querySelectorAll('#itemRowsContainer .item-row');
+        const picked  = new Set();
+        rows.forEach(row => {
+            const sel = row.querySelector('.item-select');
+            if (sel && sel.value) picked.add(sel.value);
+        });
+        rows.forEach(row => {
+            const sel = row.querySelector('.item-select');
+            if (!sel) return;
+            const current = sel.value;
+            Array.from(sel.options).forEach(opt => {
+                if (!opt.value) return;
+                opt.disabled = picked.has(opt.value) && opt.value !== current;
+            });
+        });
+        updateAddBtn();
+    }
+
+    function populateItemSelect(sel, selectedVal) {
+        if (!_orderItems.length) {
+            sel.innerHTML = '<option value="" disabled selected>Select an order first</option>';
+            updateAddBtn();
+            return;
+        }
+        sel.innerHTML = '<option value="" disabled selected>Select an item</option>' +
+            _orderItems.map(it =>
+                `<option value="${it.name}" ${selectedVal === it.name ? 'selected' : ''}>${it.name} (${it.unit})</option>`
+            ).join('');
+        sel.addEventListener('change', updateAllItemSelects);
+        updateAllItemSelects();
+    }
+
+    function addItemRow() {
+        const rows = document.querySelectorAll('#itemRowsContainer .item-row').length;
+        if (_orderItems.length > 0 && rows >= _orderItems.length) return; // all items already added
+        const container = document.getElementById('itemRowsContainer');
+        const row = document.createElement('div');
+        row.className = 'item-row';
+        row.style.cssText = 'display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;align-items:center;margin-bottom:.5rem;';
+        row.innerHTML = `
+            <select name="item_name[]" class="item-select" required style="margin:0;">
+                <option value="" disabled selected>Select an item</option>
+            </select>
+            <select name="reason[]" required style="margin:0;">
+                <option value="" disabled selected>Reason</option>
+                <option value="Damaged">Damaged Packaging</option>
+                <option value="Expired">Near Expiry / Expired</option>
+                <option value="Wrong Item">Incorrect Item Delivered</option>
+                <option value="Quality">Quality Issues</option>
+            </select>
+            <button type="button" onclick="removeItemRow(this)" style="width:34px;height:34px;border:1px solid #fecaca;background:#fef2f2;color:#991b1b;border-radius:8px;cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;" title="Remove">✕</button>
+        `;
+        container.appendChild(row);
+        populateItemSelect(row.querySelector('.item-select'));
+        updateAddBtn();
+    }
+
+    function removeItemRow(btn) {
+        const rows = document.querySelectorAll('#itemRowsContainer .item-row');
+        if (rows.length <= 1) return;
+        btn.closest('.item-row').remove();
+        updateAllItemSelects();
+        updateAddBtn();
+    }
+
+    // Populate first row on load and set initial button state
+    populateItemSelect(document.querySelector('.item-select'));
+    updateAddBtn();
+
     document.getElementById('returnModal').addEventListener('click', function(e) {
         if (e.target === this) this.classList.remove('open');
     });
 
-    // Auto-open modal if there was a form error (so user doesn't have to click again)
+    function viewPhoto(src, ref) {
+        document.getElementById('lightboxImg').src = src;
+        document.getElementById('lightboxRef').textContent = ref ? 'Receipt #: ' + ref : '';
+        document.getElementById('photoLightbox').style.display = 'flex';
+    }
+    function closeLightbox() {
+        document.getElementById('photoLightbox').style.display = 'none';
+    }
+
     <?php if ($submitErr): ?>
     document.getElementById('returnModal').classList.add('open');
     <?php endif; ?>

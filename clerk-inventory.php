@@ -1,4 +1,5 @@
 <?php
+ob_start();
 session_start();
 
 if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 3) {
@@ -16,6 +17,8 @@ $clerkName = $_SESSION['full_name'] ?? 'Inventory Clerk';
 
 // ─── AJAX: Fetch inventory table ─────────────────────────────────────────────
 if (isset($_GET['action']) && $_GET['action'] === 'fetch_inventory') {
+    error_reporting(0);
+    while (ob_get_level()) ob_end_clean();
     header('Content-Type: application/json');
 
     $search   = trim($_GET['search']   ?? '');
@@ -43,8 +46,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_inventory') {
     $sql = "
         SELECT
             p.id, p.name, p.category, p.unit, p.stock_qty, p.status,
-            b.batch_number, b.received_date, b.expiry_date, b.batch_qty, b.remaining_qty
+            sl.min_months, sl.max_months,
+            b.batch_number, b.received_date, b.batch_qty, b.remaining_qty
         FROM products p
+        LEFT JOIN shelf_life sl ON sl.category = p.category
         LEFT JOIN inventory_batches b ON b.product_id = p.id
             AND b.id = (
                 SELECT id FROM inventory_batches
@@ -57,6 +62,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_inventory') {
     ";
 
     $stmt = $conn->prepare($sql);
+    if (!$stmt) {
+        // inventory_batches table doesn't exist yet — fall back to products only
+        $fallbackSql = "SELECT p.id, p.name, p.category, p.unit, p.stock_qty, p.status,
+                               sl.min_months, sl.max_months,
+                               NULL AS batch_number, NULL AS received_date,
+                               NULL AS batch_qty, NULL AS remaining_qty
+                        FROM products p
+                        LEFT JOIN shelf_life sl ON sl.category = p.category
+                        $whereSql ORDER BY p.category, p.name";
+        $stmt = $conn->prepare($fallbackSql);
+        if (!$stmt) { echo json_encode(['success' => true, 'data' => []]); exit(); }
+    }
     if ($types && $params) {
         $stmt->bind_param($types, ...$params);
     }
@@ -69,23 +86,21 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_inventory') {
 
     foreach ($rows as &$row) {
         $stock = (int) $row['stock_qty'];
-        if ($row['expiry_date']) {
-            $exp = new DateTime($row['expiry_date']);
-            if      ($exp < $today) $row['stock_status'] = 'expired';
-            elseif  ($exp <= $soon) $row['stock_status'] = 'expiring_soon';
-            elseif  ($stock <= 5)   $row['stock_status'] = 'critical';
-            elseif  ($stock <= 20)  $row['stock_status'] = 'low';
-            else                    $row['stock_status'] = 'good';
-            $row['expiry_label']   = $exp->format('M d, Y');
-        } else {
-            if     ($stock <= 5)  $row['stock_status'] = 'critical';
-            elseif ($stock <= 20) $row['stock_status'] = 'low';
-            else                  $row['stock_status'] = 'good';
-            $row['expiry_label']  = null;
-        }
+        if     ($stock <= 0)  $row['stock_status'] = 'critical';
+        elseif ($stock <= 5)  $row['stock_status'] = 'critical';
+        elseif ($stock <= 20) $row['stock_status'] = 'low';
+        else                  $row['stock_status'] = 'good';
         $row['received_label'] = $row['received_date']
             ? (new DateTime($row['received_date']))->format('M d, Y')
             : null;
+        // Shelf life from shelf_life table
+        if (!empty($row['min_months']) && !empty($row['max_months'])) {
+            $row['shelf_life_label'] = $row['min_months'] == $row['max_months']
+                ? $row['min_months'] . ' mo'
+                : $row['min_months'] . '–' . $row['max_months'] . ' mo';
+        } else {
+            $row['shelf_life_label'] = null;
+        }
     }
     unset($row);
 
@@ -95,15 +110,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_inventory') {
 
 // ─── AJAX: Fetch stats ────────────────────────────────────────────────────────
 if (isset($_GET['action']) && $_GET['action'] === 'fetch_stats') {
+    error_reporting(0);
+    while (ob_get_level()) ob_end_clean();
     header('Content-Type: application/json');
 
     $soon = date('Y-m-d', strtotime('+7 days'));
 
-    $total    = $conn->query("SELECT COUNT(*) FROM products")->fetch_row()[0];
-    $low      = $conn->query("SELECT COUNT(*) FROM products WHERE stock_qty > 5 AND stock_qty <= 20")->fetch_row()[0];
-    $critical = $conn->query("SELECT COUNT(*) FROM products WHERE stock_qty <= 5")->fetch_row()[0];
-    $expiring = $conn->query("SELECT COUNT(DISTINCT product_id) FROM inventory_batches WHERE remaining_qty > 0 AND expiry_date IS NOT NULL AND expiry_date <= '$soon'")->fetch_row()[0];
-    $expired  = $conn->query("SELECT COUNT(DISTINCT product_id) FROM inventory_batches WHERE remaining_qty > 0 AND expiry_date IS NOT NULL AND expiry_date < CURDATE()")->fetch_row()[0];
+    $r = $conn->query("SELECT COUNT(*) FROM products"); $total = $r ? $r->fetch_row()[0] : 0;
+    $r = $conn->query("SELECT COUNT(*) FROM products WHERE stock_qty > 5 AND stock_qty <= 20"); $low = $r ? $r->fetch_row()[0] : 0;
+    $r = $conn->query("SELECT COUNT(*) FROM products WHERE stock_qty <= 5"); $critical = $r ? $r->fetch_row()[0] : 0;
+    $r = $conn->query("SELECT COUNT(DISTINCT product_id) FROM inventory_batches WHERE remaining_qty > 0 AND expiry_date IS NOT NULL AND expiry_date <= '$soon'"); $expiring = $r ? $r->fetch_row()[0] : 0;
+    $r = $conn->query("SELECT COUNT(DISTINCT product_id) FROM inventory_batches WHERE remaining_qty > 0 AND expiry_date IS NOT NULL AND expiry_date < CURDATE()"); $expired = $r ? $r->fetch_row()[0] : 0;
 
     echo json_encode([
         'success'  => true,
@@ -118,60 +135,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_stats') {
 
 // ─── AJAX: Fetch all batches for a product ───────────────────────────────────
 if (isset($_GET['action']) && $_GET['action'] === 'fetch_batches') {
+    error_reporting(0);
+    while (ob_get_level()) ob_end_clean();
     header('Content-Type: application/json');
 
     $product_id = (int)($_GET['product_id'] ?? 0);
     if (!$product_id) { echo json_encode(['success' => false]); exit(); }
 
-    // inventory_batches (original batch records)
-    $stmt = $conn->prepare("
-        SELECT b.*, p.name AS product_name, p.unit
-        FROM inventory_batches b
-        JOIN products p ON p.id = b.product_id
-        WHERE b.product_id = ?
-        ORDER BY b.received_date ASC
-    ");
-    $stmt->bind_param("i", $product_id);
-    $stmt->execute();
-    $batches = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt->close();
+    // stock_receipts — history of received stock for this product
+    $receipts = [];
+    $stmt2 = $conn->prepare("SELECT r.id, r.batch_number, r.quantity, r.unit, r.created_at AS event_date, r.qc_notes, u.full_name AS done_by, 'receipt' AS event_type FROM stock_receipts r LEFT JOIN users u ON u.user_id = r.recorded_by WHERE r.product_id = ? ORDER BY r.created_at DESC");
+    if ($stmt2) { $stmt2->bind_param("i", $product_id); $stmt2->execute(); $receipts = $stmt2->get_result()->fetch_all(MYSQLI_ASSOC); $stmt2->close(); }
 
-    // stock_receipts: additions from receiving module
-    $stmt2 = $conn->prepare("
-        SELECT r.id, r.batch_number, r.quantity, r.unit, r.arrival_date AS event_date,
-               r.mfg_date, r.expiry_date, r.qc_notes,
-               u.full_name AS done_by,
-               'receipt' AS event_type
-        FROM stock_receipts r
-        LEFT JOIN users u ON u.user_id = r.recorded_by
-        WHERE r.product_id = ?
-        ORDER BY r.arrival_date DESC
-    ");
-    $stmt2->bind_param("i", $product_id);
-    $stmt2->execute();
-    $receipts = $stmt2->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt2->close();
-
-    // stock_adjustments: additions and deductions
-    $stmt3 = $conn->prepare("
-        SELECT a.id, a.adj_type, a.quantity, a.reason_code, a.notes, a.adjusted_at AS event_date,
-               p.unit,
-               u.full_name AS done_by,
-               'adjustment' AS event_type
-        FROM stock_adjustments a
-        LEFT JOIN products p ON p.id = a.product_id
-        LEFT JOIN users    u ON u.user_id = a.adjusted_by
-        WHERE a.product_id = ?
-        ORDER BY a.adjusted_at DESC
-    ");
-    $stmt3->bind_param("i", $product_id);
-    $stmt3->execute();
-    $adjustments = $stmt3->get_result()->fetch_all(MYSQLI_ASSOC);
-    $stmt3->close();
+    // stock_adjustments
+    $adjustments = [];
+    $stmt3 = $conn->prepare("SELECT a.id, a.adj_type, a.quantity, a.reason_code, a.notes, a.adjusted_at AS event_date, p.unit, u.full_name AS done_by, 'adjustment' AS event_type FROM stock_adjustments a LEFT JOIN products p ON p.id = a.product_id LEFT JOIN users u ON u.user_id = a.adjusted_by WHERE a.product_id = ? ORDER BY a.adjusted_at DESC");
+    if ($stmt3) { $stmt3->bind_param("i", $product_id); $stmt3->execute(); $adjustments = $stmt3->get_result()->fetch_all(MYSQLI_ASSOC); $stmt3->close(); }
 
     echo json_encode([
         'success'     => true,
-        'batches'     => $batches,
         'receipts'    => $receipts,
         'adjustments' => $adjustments,
     ]);
@@ -179,10 +161,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch_batches') {
 }
 
 // ─── Categories for filter dropdown ──────────────────────────────────────────
-$categories = array_column(
-    $conn->query("SELECT DISTINCT category FROM products ORDER BY category")->fetch_all(MYSQLI_ASSOC),
-    'category'
-);
+$categories = [];
+$catRes = $conn->query("SELECT DISTINCT category FROM products ORDER BY category");
+if ($catRes) {
+    $categories = array_column($catRes->fetch_all(MYSQLI_ASSOC), 'category');
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -397,9 +380,9 @@ $categories = array_column(
                     <th>Item</th>
                     <th>Category</th>
                     <th>Current Stock</th>
-                    <th>Oldest Active Batch</th>
+                    <th>Shelf Life</th>
                     <th>Status</th>
-                    <th>All Batches</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody id="tableBody">
@@ -481,22 +464,9 @@ $categories = array_column(
             tbody.innerHTML = d.data.map(r => {
                 const statusHtml = pillMap[r.stock_status] ?? pillMap.good;
 
-                let batchHtml = `<span style="color:var(--muted);font-size:0.8rem;">No batch data</span>`;
-                if (r.batch_number) {
-                    const isExpired = r.stock_status === 'expired';
-                    const isSoon    = r.stock_status === 'expiring_soon';
-                    const cls       = isExpired ? 'warn' : (isSoon ? 'caution' : '');
-                    const expLine   = r.expiry_label
-                        ? `<div>${isExpired ? '⚠️ Expired' : (isSoon ? '⏰ Expires' : 'Expires')}: <strong>${esc(r.expiry_label)}</strong></div>`
-                        : `<div>Expiry: N/A</div>`;
-                    batchHtml = `
-                        <div class="batch-chip ${cls}">
-                            <div>Batch: <strong>${esc(r.batch_number)}</strong></div>
-                            <div>Received: ${esc(r.received_label ?? '—')}</div>
-                            ${expLine}
-                            <div>Remaining: ${parseFloat(r.remaining_qty ?? 0).toLocaleString()} ${esc(r.unit)}</div>
-                        </div>`;
-                }
+                const shelfHtml = r.shelf_life_label
+                    ? `<span style="font-size:.85rem;background:var(--background);padding:.2rem .55rem;border-radius:6px;color:var(--muted);">${esc(r.shelf_life_label)}</span>`
+                    : `<span style="color:var(--muted);font-size:.8rem;">\u2014</span>`;
 
                 return `
                 <tr>
@@ -505,17 +475,16 @@ $categories = array_column(
                         <div style="font-size:0.75rem;color:var(--muted);">ID: ${r.id}</div>
                     </td>
                     <td>${esc(r.category)}</td>
-                    <td><strong>${parseFloat(r.stock_qty).toLocaleString()} ${esc(r.unit)}</strong></td>
-                    <td>${batchHtml}</td>
+                    <td><strong>${parseInt(r.stock_qty)} ${esc(r.unit)}</strong></td>
+                    <td>${shelfHtml}</td>
                     <td>${statusHtml}</td>
                     <td>
-                        <button class="btn-icon" title="View all batches"
+                        <button class="btn-icon" title="View action history"
                             onclick="openBatchModal(${r.id}, '${esc(r.name).replace(/'/g,"\\'")}')">
                             <i data-lucide="layers" style="width:16px;height:16px;"></i>
                         </button>
                     </td>
-                </tr>`;
-            }).join('');
+                </tr>`;}).join('');
 
             lucide.createIcons();
         } catch(e) {
@@ -533,7 +502,7 @@ $categories = array_column(
 
     // ── Batch Modal ───────────────────────────────────────────────────────────
     async function openBatchModal(productId, productName) {
-        document.getElementById('batchTitle').textContent  = productName + ' — Batch History';
+        document.getElementById('batchTitle').textContent  = productName + ' — Action History';
         document.getElementById('batchContent').innerHTML = '<p style="color:var(--muted);padding:1rem 0;">Loading…</p>';
         document.getElementById('batchOverlay').style.display = 'flex';
 
@@ -545,47 +514,9 @@ $categories = array_column(
                     '<p style="color:var(--muted);padding:1rem 0;">No records found for this item.</p>';
                 return;
             }
-
-            const today = new Date();
-            let firstActive = true;
             let html = '';
 
-            // ── Section 1: Inventory Batches ──────────────────────────────
-            if (d.batches && d.batches.length) {
-                const batchRows = d.batches.map(b => {
-                    const exp     = b.expiry_date ? new Date(b.expiry_date) : null;
-                    const expTxt  = exp ? exp.toLocaleDateString('en-PH', {year:'numeric',month:'short',day:'numeric'}) : 'N/A';
-                    const isExp   = exp && exp < today;
-                    const recTxt  = b.received_date
-                        ? new Date(b.received_date).toLocaleDateString('en-PH', {year:'numeric',month:'short',day:'numeric'})
-                        : '—';
-                    const isActive    = parseFloat(b.remaining_qty) > 0 && firstActive;
-                    if (isActive) firstActive = false;
-                    const fifoTag     = isActive ? '<span class="fifo-tag">FIFO NEXT</span>' : '';
-                    const expStyle    = isExp ? 'color:#b91c1c;font-weight:700;' : '';
-                    const remainStyle = parseFloat(b.remaining_qty) === 0 ? 'color:var(--muted);text-decoration:line-through;' : '';
-
-                    return `<tr>
-                        <td>${esc(b.batch_number ?? '—')}${fifoTag}</td>
-                        <td>${recTxt}</td>
-                        <td style="${expStyle}">${expTxt}${isExp ? ' ⚠️' : ''}</td>
-                        <td>${parseFloat(b.batch_qty ?? 0).toLocaleString()} ${esc(b.unit)}</td>
-                        <td style="${remainStyle}">${parseFloat(b.remaining_qty ?? 0).toLocaleString()} ${esc(b.unit)}</td>
-                    </tr>`;
-                }).join('');
-
-                html += `
-                    <p style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);font-weight:700;margin-bottom:0.6rem;">Inventory Batches</p>
-                    <table class="batch-table" style="margin-bottom:2rem;">
-                        <thead><tr>
-                            <th>Batch #</th><th>Received</th><th>Expiry</th><th>Total Qty</th><th>Remaining</th>
-                        </tr></thead>
-                        <tbody>${batchRows}</tbody>
-                    </table>`;
-            }
-
-            // ── Section 2: Stock Movement History ────────────────────────
-            // Merge receipts and adjustments into one timeline
+            // ── Stock Movement History (receipts + adjustments merged) ────
             const movements = [];
 
             (d.receipts || []).forEach(r => movements.push({
@@ -595,7 +526,7 @@ $categories = array_column(
                 qty:    parseFloat(r.quantity),
                 unit:   r.unit,
                 label:  'New Stock',
-                detail: r.batch_number ? 'Batch: ' + r.batch_number : '',
+                detail: (r.batch_number ? 'Batch: ' + r.batch_number : '') + (r.qc_notes ? ' · ' + r.qc_notes : ''),
                 by:     r.done_by || '—',
                 cls:    'move-add',
             }));
@@ -615,6 +546,10 @@ $categories = array_column(
             // Sort newest first
             movements.sort((a, b) => new Date(b.date) - new Date(a.date));
 
+            if (!movements.length) {
+                document.getElementById('batchContent').innerHTML = '<p style="color:var(--muted);padding:1rem 0;text-align:center;">No stock movements recorded yet.</p>';
+                return;
+            }
             if (movements.length) {
                 const moveRows = movements.map(m => {
                     const dateTxt = new Date(m.date).toLocaleString('en-PH', {
@@ -631,7 +566,6 @@ $categories = array_column(
                 }).join('');
 
                 html += `
-                    <p style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);font-weight:700;margin-bottom:0.6rem;">Stock Movement History</p>
                     <table class="batch-table">
                         <thead><tr>
                             <th>Date &amp; Time</th><th>Change</th><th>Type</th><th>Reason / Batch</th><th>By</th>

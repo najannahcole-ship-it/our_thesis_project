@@ -35,9 +35,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
         $productId   = (int)   ($_POST['product_id']   ?? 0);
         $adjType     = trim($_POST['adj_type']          ?? '');  // 'add' or 'subtract'
-        $quantity    = (float) ($_POST['quantity']      ?? 0);
+        $quantity    = (int)   ($_POST['quantity']      ?? 0);
         $reasonCode  = trim($_POST['reason_code']       ?? '');
-        $batchId     = (int)   ($_POST['batch_id']      ?? 0) ?: null;
         $notes       = trim($_POST['notes']             ?? '') ?: null;
 
         // Validation
@@ -70,21 +69,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $conn->begin_transaction();
         try {
             // Insert into stock_adjustments
+            $adjType = 'subtract'; // always subtract
             $ins = $conn->prepare("
                 INSERT INTO stock_adjustments
-                    (product_id, batch_id, adj_type, quantity, reason_code, notes, adjusted_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (product_id, adj_type, quantity, reason_code, notes, adjusted_by)
+                VALUES (?, 'subtract', ?, ?, ?, ?)
             ");
-            $ins->bind_param("iidsssi", $productId, $batchId, $quantity, $adjType, $reasonCode, $notes, $clerkUserId);
+            $ins->bind_param("idssi", $productId, $quantity, $reasonCode, $notes, $clerkUserId);
             $ins->execute();
             $adjId = $conn->insert_id;
             $ins->close();
 
-            // Update products.stock_qty — deduct only
+            // Get current stock before update
+            $sq = $conn->prepare("SELECT stock_qty FROM products WHERE id = ? LIMIT 1");
+            $sq->bind_param("i", $productId); $sq->execute();
+            $prevStock = (int)$sq->get_result()->fetch_assoc()['stock_qty']; $sq->close();
+            $newStock  = $prevStock - (int)$quantity;
+
+            // Update products.stock_qty
             $upd = $conn->prepare("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?");
             $upd->bind_param("di", $quantity, $productId);
-            $upd->execute();
-            $upd->close();
+            $upd->execute(); $upd->close();
+
+            // Write to inventory_logs
+            $qtyInt  = (int)$quantity;
+            $remarks = "Stock adjustment — " . $reasonCode;
+            $log = $conn->prepare("
+                INSERT INTO inventory_logs
+                    (product_id, action, quantity, unit, previous_stock, new_stock, remarks, created_by)
+                VALUES (?, 'deduct', ?, ?, ?, ?, ?, ?)
+            ");
+            // fetch unit first
+            $us = $conn->prepare("SELECT unit FROM products WHERE id = ? LIMIT 1");
+            $us->bind_param("i", $productId); $us->execute();
+            $punit = $us->get_result()->fetch_assoc()['unit'] ?? ''; $us->close();
+            $log->bind_param("iisiisi", $productId, $qtyInt, $punit, $prevStock, $newStock, $remarks, $clerkUserId);
+            $log->execute(); $log->close();
 
             $conn->commit();
 
@@ -143,11 +163,8 @@ $res = $conn->query("
     ORDER BY a.adjusted_at DESC
     LIMIT 20
 ");
-while ($row = $res->fetch_assoc()) $recentAdj[] = $row;
+if ($res) while ($row = $res->fetch_assoc()) $recentAdj[] = $row;
 
-// Stats
-$totalAdjMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE MONTH(adjusted_at)=MONTH(CURDATE()) AND YEAR(adjusted_at)=YEAR(CURDATE())")->fetch_row()[0];
-$totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_type='subtract' AND MONTH(adjusted_at)=MONTH(CURDATE()) AND YEAR(adjusted_at)=YEAR(CURDATE())")->fetch_row()[0];
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -244,19 +261,6 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
         .header h2 { font-family: 'Fraunces', serif; font-size: 2rem; margin-bottom: 0.25rem; }
         .header p  { color: var(--muted); font-size: 1rem; }
 
-        /* ── Stats ────────────────────────────────────────────── */
-        .stats-grid {
-            display: grid; grid-template-columns: repeat(2, 1fr);
-            gap: 1.5rem; margin-bottom: 2.5rem;
-        }
-        .stat-card {
-            background: white; padding: 1.5rem;
-            border-radius: 20px; border: 1px solid var(--card-border);
-        }
-        .stat-card .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; margin-bottom: 0.5rem; }
-        .stat-card .value { font-family: 'Fraunces', serif; font-size: 2.25rem; color: var(--primary); }
-        .stat-card .sub   { font-size: 0.8rem; color: var(--muted); margin-top: 0.35rem; }
-
         /* ── Card / Form ──────────────────────────────────────── */
         .card {
             background: white; border: 1px solid var(--card-border);
@@ -287,9 +291,6 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
             outline: none; border-color: var(--accent); background: white;
             box-shadow: 0 0 0 4px rgba(210,84,36,0.05);
         }
-        .qty-row { display: flex; gap: 0.5rem; }
-        .qty-row input  { flex: 1; }
-        .qty-row select { width: 110px; }
 
         /* Stock preview badge */
         #stockPreview {
@@ -453,20 +454,6 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
         </div>
     </div>
 
-    <!-- Stats -->
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="label">Adjustments This Month</div>
-            <div class="value"><?= $totalAdjMonth ?></div>
-            <div class="sub">Total logged entries</div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Stock Deductions</div>
-            <div class="value" style="color:var(--error);"><?= $totalSubMonth ?></div>
-            <div class="sub">This month</div>
-        </div>
-    </div>
-
     <!-- Adjustment Form -->
     <div class="card" data-testid="card-adjustment-form">
         <div class="card-title">
@@ -520,14 +507,9 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
 
                 <div class="form-group">
                     <label for="quantity">Quantity *</label>
-                    <div class="qty-row">
-                        <input id="quantity" name="quantity" type="number"
-                               placeholder="0" min="0.01" step="0.01"
-                               data-testid="input-adj-qty" required>
-                        <select id="unit_display" style="width:110px;" disabled>
-                            <option id="unitOption">—</option>
-                        </select>
-                    </div>
+                    <input id="quantity" name="quantity" type="number"
+                           placeholder="0" min="1" step="1"
+                           data-testid="input-adj-qty" required>
                 </div>
 
                 <div class="form-group">
@@ -537,17 +519,7 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
                         <option value="Spoilage">Spoilage / Expired</option>
                         <option value="Damage">Physical Damage / Spills</option>
                         <option value="Discrepancy">Physical Count Discrepancy</option>
-                        <option value="QC">QC Reject / Substandard</option>
-                        <option value="Waste">Production Waste</option>
-                        <option value="Correction">Data Entry Correction</option>
                     </select>
-                </div>
-
-                <div class="form-group">
-                    <label for="batch_id">Related Batch ID (Optional)</label>
-                    <input id="batch_id" name="batch_id" type="number"
-                           placeholder="Leave blank if not applicable"
-                           data-testid="input-adj-batch">
                 </div>
 
                 <div class="form-group">
@@ -609,7 +581,7 @@ $totalSubMonth = $conn->query("SELECT COUNT(*) FROM stock_adjustments WHERE adj_
                     <td><strong><?= htmlspecialchars($a['product_name']) ?></strong></td>
                     <td>
                         <span class="qty-badge <?= $a['adj_type'] === 'subtract' ? 'qty-negative' : 'qty-positive' ?>">
-                            <?= $a['adj_type'] === 'subtract' ? '−' : '+' ?><?= htmlspecialchars($a['quantity'] + 0) ?> <?= htmlspecialchars($a['unit']) ?>
+                            <?= $a['adj_type'] === 'subtract' ? '−' : '+' ?><?= (int)$a['quantity'] ?> <?= htmlspecialchars($a['unit']) ?>
                         </span>
                     </td>
                     <td><span class="reason-badge reason-<?= htmlspecialchars($a['reason_code']) ?>"><?= htmlspecialchars($a['reason_code']) ?></span></td>
@@ -652,10 +624,8 @@ document.getElementById('product_id').addEventListener('change', function () {
     const qty  = opt.dataset.qty;
     const preview = document.getElementById('stockPreview');
     const previewText = document.getElementById('stockPreviewText');
-    const unitOpt = document.getElementById('unitOption');
 
     if (unit) {
-        unitOpt.textContent = unit;
         preview.style.display = 'flex';
         previewText.textContent = `Current stock: ${qty} ${unit}`;
         lucide.createIcons();
@@ -666,7 +636,6 @@ document.getElementById('product_id').addEventListener('change', function () {
 });
 
 function resetUnitDisplay() {
-    document.getElementById('unitOption').textContent = '—';
     document.getElementById('stockPreview').style.display = 'none';
 }
 
@@ -706,7 +675,8 @@ document.getElementById('adjustmentForm').addEventListener('submit', async funct
     // Capture display values before reset
     const selEl    = document.getElementById('product_id');
     const prodName = selEl.options[selEl.selectedIndex]?.text?.split(' (')[0] ?? '—';
-    const unit     = document.getElementById('unitOption').textContent;
+    const selOpt   = selEl.options[selEl.selectedIndex];
+    const unit     = selOpt?.dataset.unit ?? '';
 
     const fd = new FormData(this);
     fd.append('action', 'log_adjustment');
@@ -792,7 +762,6 @@ async function viewAdjustment(id) {
             <div class="detail-item"><div class="label">Reason</div><div class="value"><span class="reason-badge reason-${d.reason_code}">${fmt(d.reason_code)}</span></div></div>
             <div class="detail-item"><div class="label">Adjusted By</div><div class="value">${fmt(d.adjusted_by_name)}</div></div>
             <div class="detail-item"><div class="label">Date &amp; Time</div><div class="value">${fmtDT(d.adjusted_at)}</div></div>
-            <div class="detail-item"><div class="label">Batch ID</div><div class="value">${fmt(d.batch_id)}</div></div>
             <div class="detail-item full"><div class="label">Notes</div><div class="value">${fmt(d.notes)}</div></div>
         `;
     } catch (err) {

@@ -19,18 +19,31 @@ $riderId   = $_SESSION['user_id'];
 $riderName = $_SESSION['full_name'] ?? 'Delivery Rider';
 
 // Search / filter
-$searchTerm = $_GET['search'] ?? '';
-$dateFrom   = $_GET['date_from'] ?? date('Y-m-01');
-$dateTo     = $_GET['date_to']   ?? date('Y-m-d');
+// When no date is supplied (first page load) we show ALL completed deliveries.
+$searchTerm  = $_GET['search']    ?? '';
+$dateFrom    = $_GET['date_from'] ?? '';
+$dateTo      = $_GET['date_to']   ?? '';
+$hasDateFilter = $dateFrom !== '' || $dateTo !== '';
 
 // ── Fetch completed deliveries ────────────────────────────────
 $completedOrders = [];
 $whereExtra = '';
-$params = [$dateFrom, $dateTo];
-$types  = 'ss';
+$params = [$riderId];
+$types  = 'i';
+
+// Only apply date range when the user has actually set filters
+// Use the actual delivery completion timestamp from order_status_history
+if ($hasDateFilter) {
+    $df = $dateFrom ?: '2000-01-01';
+    $dt = $dateTo   ?: date('Y-m-d');
+    $whereExtra .= " AND DATE(osh.changed_at) BETWEEN ? AND ?";
+    $params[] = $df;
+    $params[] = $dt;
+    $types   .= 'ss';
+}
 
 if ($searchTerm) {
-    $whereExtra = " AND (o.po_number LIKE ? OR f.franchisee_name LIKE ? OR f.branch_name LIKE ?)";
+    $whereExtra .= " AND (o.po_number LIKE ? OR f.franchisee_name LIKE ? OR f.branch_name LIKE ?)";
     $like = '%' . $searchTerm . '%';
     $params = array_merge($params, [$like, $like, $like]);
     $types .= 'sss';
@@ -38,17 +51,21 @@ if ($searchTerm) {
 
 $sql = "
     SELECT o.id, o.po_number, o.created_at, o.total_amount,
-           o.delivery_preference, o.estimated_pickup,
+           o.delivery_preference, o.estimated_pickup, o.payment_method,
            f.branch_name, f.franchisee_name,
-           COUNT(oi.id) as item_count
+           COUNT(DISTINCT oi.id) as item_count,
+           osh.changed_at AS delivered_at
     FROM orders o
     LEFT JOIN franchisees f ON f.id = o.franchisee_id
     LEFT JOIN order_items oi ON oi.order_id = o.id
-    WHERE o.status_step = 4
-    AND DATE(o.created_at) BETWEEN ? AND ?
+    LEFT JOIN order_status_history osh
+        ON osh.order_id = o.id AND osh.status_step = 4
+    WHERE o.rider_id = ?
+    AND o.status_step = 4
+    AND o.delivery_preference != 'Self Pickup'
     $whereExtra
-    GROUP BY o.id
-    ORDER BY o.created_at DESC
+    GROUP BY o.id, osh.changed_at
+    ORDER BY COALESCE(osh.changed_at, o.created_at) DESC
 ";
 
 $stmt = $conn->prepare($sql);
@@ -62,8 +79,12 @@ $stmt->close();
 $totalDeliveries = count($completedOrders);
 $totalValue      = array_sum(array_column($completedOrders, 'total_amount'));
 
-// All-time count
-$allTime = $conn->query("SELECT COUNT(*) as cnt FROM orders WHERE status_step = 4")->fetch_assoc()['cnt'] ?? 0;
+// All-time count — scoped to this rider
+$stmtAt = $conn->prepare("SELECT COUNT(*) as cnt FROM orders WHERE rider_id = ? AND status_step = 4");
+$stmtAt->bind_param("i", $riderId);
+$stmtAt->execute();
+$allTime = $stmtAt->get_result()->fetch_assoc()['cnt'] ?? 0;
+$stmtAt->close();
 
 $conn->close();
 ?>
@@ -118,6 +139,7 @@ $conn->close();
         .search-wrap i{position:absolute;left:.9rem;top:50%;transform:translateY(-50%);color:var(--muted);width:16px;height:16px;}
         .search-wrap input{width:100%;padding:.65rem .9rem .65rem 2.5rem;border:1.5px solid var(--card-border);border-radius:10px;font-family:inherit;font-size:.9rem;outline:none;}
         .btn-filter{background:var(--primary);color:white;border:none;padding:.65rem 1.25rem;border-radius:10px;font-weight:600;font-family:inherit;font-size:.88rem;cursor:pointer;align-self:flex-end;}
+        .btn-clear{background:transparent;color:var(--muted);border:1.5px solid var(--card-border);padding:.65rem 1rem;border-radius:10px;font-weight:600;font-family:inherit;font-size:.88rem;cursor:pointer;text-decoration:none;align-self:flex-end;display:inline-block;}
         /* Table */
         .card{background:white;border:1px solid var(--card-border);border-radius:20px;overflow:hidden;}
         table{width:100%;border-collapse:collapse;}
@@ -147,15 +169,15 @@ $conn->close();
 </aside>
 
 <main>
-    <div class="header"><h2>Delivery History</h2><p>Record of all completed deliveries and pickups.</p></div>
+    <div class="header"><h2>Delivery History</h2><p>Record of all completed deliveries.</p></div>
 
     <!-- Stats -->
     <div class="stats-row">
         <div class="stat-card">
             <i data-lucide="check-circle" class="ic" style="color:#10b981"></i>
-            <div class="lbl">This Period</div>
+            <div class="lbl"><?php echo $hasDateFilter ? 'This Period' : 'All Deliveries'; ?></div>
             <div class="val"><?php echo $totalDeliveries; ?></div>
-            <div class="sub"><?php echo date('M d', strtotime($dateFrom)); ?> – <?php echo date('M d, Y', strtotime($dateTo)); ?></div>
+            <div class="sub"><?php echo $hasDateFilter ? (date('M d', strtotime($dateFrom ?: '2000-01-01')) . ' – ' . date('M d, Y', strtotime($dateTo ?: date('Y-m-d')))) : 'All time, all branches'; ?></div>
         </div>
         <div class="stat-card">
             <i data-lucide="trending-up" class="ic" style="color:#3b82f6"></i>
@@ -182,13 +204,16 @@ $conn->close();
         </div>
         <div class="filter-group">
             <label>From</label>
-            <input type="date" name="date_from" value="<?php echo $dateFrom; ?>">
+            <input type="date" name="date_from" value="<?php echo htmlspecialchars($dateFrom); ?>">
         </div>
         <div class="filter-group">
             <label>To</label>
-            <input type="date" name="date_to" value="<?php echo $dateTo; ?>">
+            <input type="date" name="date_to" value="<?php echo htmlspecialchars($dateTo); ?>">
         </div>
         <button type="submit" class="btn-filter">Filter</button>
+        <?php if ($hasDateFilter || $searchTerm): ?>
+        <a href="rider-history.php" class="btn-clear">Clear</a>
+        <?php endif; ?>
     </form>
 
     <!-- History Table -->
@@ -200,6 +225,7 @@ $conn->close();
                     <th>Franchisee / Branch</th>
                     <th>Items</th>
                     <th>Type</th>
+                    <th>Payment</th>
                     <th>Date Completed</th>
                     <th style="text-align:right">Amount</th>
                     <th></th>
@@ -207,7 +233,7 @@ $conn->close();
             </thead>
             <tbody>
                 <?php if (empty($completedOrders)): ?>
-                <tr class="empty-row"><td colspan="7">No deliveries found for this period.</td></tr>
+                <tr class="empty-row"><td colspan="8">No deliveries found for this period.</td></tr>
                 <?php else: foreach ($completedOrders as $o): ?>
                 <tr>
                     <td style="font-weight:700;"><?php echo htmlspecialchars($o['po_number']); ?></td>
@@ -217,11 +243,17 @@ $conn->close();
                     </td>
                     <td style="font-size:.88rem;"><?php echo $o['item_count']; ?> item<?php echo $o['item_count'] != 1 ? 's' : ''; ?></td>
                     <td>
-                        <span class="<?php echo $o['delivery_preference'] === 'Self Pickup' ? 'pill-pickup' : 'pill-done'; ?>">
-                            <?php echo htmlspecialchars($o['delivery_preference']); ?>
-                        </span>
+                        <span class="pill-done"><?php echo htmlspecialchars($o['delivery_preference']); ?></span>
                     </td>
-                    <td style="font-size:.875rem;color:var(--muted);"><?php echo date('M d, Y', strtotime($o['created_at'])); ?></td>
+                    <td>
+                        <?php
+                        $pm = strtolower($o['payment_method'] ?? '');
+                        $isCod = str_contains($pm, 'cod') || str_contains($pm, 'cash');
+                        echo '<span style="background:' . ($isCod ? '#fef3c7' : '#dcfce7') . ';color:' . ($isCod ? '#92400e' : '#166534') . ';padding:.25rem .75rem;border-radius:20px;font-size:.75rem;font-weight:600;display:inline-block;">'
+                            . ($isCod ? '💵 ' : '✓ ') . htmlspecialchars($o['payment_method'] ?? '—') . '</span>';
+                        ?>
+                    </td>
+                    <td style="font-size:.875rem;color:var(--muted);"><?php echo date('M d, Y', strtotime($o['delivered_at'] ?? $o['created_at'])); ?></td>
                     <td style="text-align:right;font-weight:700;">₱<?php echo number_format($o['total_amount'], 2); ?></td>
                     <td><a href="rider-tracking.php?po=<?php echo urlencode($o['po_number']); ?>" class="view-link">View →</a></td>
                 </tr>

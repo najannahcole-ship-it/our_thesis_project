@@ -107,6 +107,8 @@ function stepLabel($s) {
         .summary-card .label{font-size:.9rem;color:var(--muted);margin-bottom:.5rem;font-weight:500;}
         .summary-card .value{font-size:2rem;font-weight:700;font-family:'Fraunces',serif;}
         .summary-card .subtext{font-size:.8rem;color:var(--muted);margin-top:.5rem;}
+        .summary-card-link{display:block;text-decoration:none;color:inherit;border-radius:20px;transition:transform .18s,box-shadow .18s;}
+        .summary-card-link:hover{transform:translateY(-4px);box-shadow:0 10px 28px rgba(92,64,51,.13);}
         .content-grid{display:grid;grid-template-columns:2fr 1fr;gap:1.5rem;}
         .card{background:white;border:1px solid var(--card-border);border-radius:20px;padding:2rem;}
         .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;}
@@ -150,35 +152,42 @@ function stepLabel($s) {
 <main>
     <div class="header">
         <div><h2>Encoder Dashboard</h2><p>Welcome back, <?php echo htmlspecialchars($encoderName); ?>! Here's what needs your attention today.</p></div>
-        <a href="encoder-orders.php" class="btn-action"><i data-lucide="inbox" size="16"></i> View Order Queue</a>
     </div>
 
     <!-- Live Stats from DB -->
     <div class="summary-grid">
+        <a href="encoder-orders.php?filter=pending" class="summary-card-link">
         <div class="summary-card">
             <i data-lucide="clock" class="icon-badge" style="color:var(--accent)"></i>
             <p class="label">Pending Orders</p>
             <div class="value"><?php echo $pendingOrders; ?></div>
             <p class="subtext">Awaiting encoding</p>
         </div>
+        </a>
+        <a href="encoder-orders.php?filter=today" class="summary-card-link">
         <div class="summary-card">
             <i data-lucide="check-circle" class="icon-badge" style="color:#10b981"></i>
             <p class="label">Processed Today</p>
             <div class="value"><?php echo $processedToday; ?></div>
             <p class="subtext">Successfully encoded</p>
         </div>
+        </a>
+        <a href="encoder-returns.php?filter=pending" class="summary-card-link">
         <div class="summary-card">
             <i data-lucide="rotate-ccw" class="icon-badge" style="color:#ef4444"></i>
             <p class="label">Returns Pending</p>
             <div class="value"><?php echo $returnsPending; ?></div>
             <p class="subtext">Requires attention</p>
         </div>
+        </a>
+        <a href="encoder-orders.php?filter=all" class="summary-card-link">
         <div class="summary-card">
             <i data-lucide="package" class="icon-badge" style="color:#3b82f6"></i>
             <p class="label">Total Processed</p>
             <div class="value"><?php echo $totalProcessed; ?></div>
             <p class="subtext">All time orders handled</p>
         </div>
+        </a>
     </div>
 
     <div class="content-grid">

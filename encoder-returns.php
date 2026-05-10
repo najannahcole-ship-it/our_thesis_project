@@ -16,6 +16,9 @@ require_once 'db.php';
 $encoderName = $_SESSION['full_name'] ?? 'Data Encoder';
 $encoderId   = $_SESSION['user_id'];
 
+// Auto-add resolution_photo column if it doesn't exist
+$conn->query("ALTER TABLE `returns` ADD COLUMN IF NOT EXISTS `resolution_photo` VARCHAR(255) NULL");
+
 // ── Handle POST: finalize a return ───────────────────────────
 $actionMsg = '';
 $actionErr = '';
@@ -30,14 +33,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (empty($payRef)) {
             $actionErr = "Please enter a payment reference number before finalizing.";
         } else {
-            // Append resolution note to existing notes
+            // Handle screenshot upload
+            $screenshotPath = null;
+            if (!empty($_FILES['resolution_screenshot']['tmp_name']) && $_FILES['resolution_screenshot']['error'] === UPLOAD_ERR_OK) {
+                $uploadDir = __DIR__ . '/uploads/return_screenshots/';
+                if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+                $ext     = strtolower(pathinfo($_FILES['resolution_screenshot']['name'], PATHINFO_EXTENSION));
+                $allowed = ['jpg','jpeg','png','gif','webp'];
+                if (in_array($ext, $allowed) && $_FILES['resolution_screenshot']['size'] <= 5 * 1024 * 1024) {
+                    $safeName = 'ret_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+                    if (move_uploaded_file($_FILES['resolution_screenshot']['tmp_name'], $uploadDir . $safeName)) {
+                        $screenshotPath = 'uploads/return_screenshots/' . $safeName;
+                    }
+                }
+            }
+
             $fullNotes = $resoNotes ? "Resolution: $resoNotes | Ref: $payRef" : "Payment Ref: $payRef";
 
-            $upd = $conn->prepare("UPDATE returns SET status = 'Resolved', resolved_at = NOW(), notes = CONCAT(IFNULL(notes,''), ' | ', ?) WHERE id = ? AND status = 'Approved'");
-            $upd->bind_param("si", $fullNotes, $returnId);
+            // Save screenshot path to dedicated column, not concatenated into notes
+            $upd = $conn->prepare("
+                UPDATE returns
+                SET status = 'Resolved',
+                    resolved_at = NOW(),
+                    notes = CONCAT(IFNULL(notes,''), ' | ', ?),
+                    resolution_photo = ?
+                WHERE id = ? AND status = 'Approved'
+            ");
+            $upd->bind_param("ssi", $fullNotes, $screenshotPath, $returnId);
             $upd->execute();
             $upd->close();
-            $actionMsg = "Return case resolved successfully. Payment reference recorded.";
+            $actionMsg = "Return case resolved successfully. The franchisee has been notified.";
         }
     }
 }
@@ -104,7 +129,7 @@ if ($selectedId) {
     // If not in filtered list, fetch directly
     if (!$selectedReturn) {
         $stmt = $conn->prepare("
-            SELECT r.*, o.po_number, o.total_amount, f.franchisee_name, f.branch_name
+            SELECT r.*, r.resolution_photo, o.po_number, o.total_amount, f.franchisee_name, f.branch_name
             FROM returns r
             LEFT JOIN franchisees f ON f.id = r.franchisee_id
             LEFT JOIN orders o ON o.id = r.order_id
@@ -305,7 +330,7 @@ $conn->close();
                 </div>
 
                 <?php if ($selectedReturn['status'] === 'Approved'): ?>
-                <form method="POST" action="encoder-returns.php?id=<?php echo $selectedReturn['id']; ?>&filter=<?php echo $filterStatus; ?>">
+                <form method="POST" action="encoder-returns.php?id=<?php echo $selectedReturn['id']; ?>&filter=<?php echo $filterStatus; ?>" enctype="multipart/form-data">
                     <input type="hidden" name="return_id" value="<?php echo $selectedReturn['id']; ?>">
                     <div class="form-group">
                         <label>Payment Reference Number <span style="color:#ef4444;">*</span></label>
@@ -315,11 +340,56 @@ $conn->close();
                         <label>Resolution Details & Communication</label>
                         <textarea name="resolution_notes" rows="4" placeholder="Enter details to communicate to the franchisee...">The return request for <?php echo htmlspecialchars($selectedReturn['item_name']); ?> (<?php echo htmlspecialchars($selectedReturn['reason']); ?>) has been verified and approved. A refund has been processed to your registered account.</textarea>
                     </div>
-                    <div style="display:grid;gap:.75rem;">
-                        <button type="submit" name="action" value="resolve" class="btn btn-primary"><i data-lucide="check-square"></i> Finalize & Close Case</button>
-                        <button type="button" class="btn btn-outline" onclick="window.print()"><i data-lucide="printer"></i> Print Resolution</button>
+                    <div class="form-group">
+                        <label>Payment Screenshot <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
+                        <div id="ssUploadBox" style="border:2px dashed var(--card-border);border-radius:10px;padding:1.25rem;text-align:center;cursor:pointer;background:#fafafa;transition:border-color .2s;" onclick="document.getElementById('ssFile').click()">
+                            <div style="font-size:1.25rem;margin-bottom:.25rem;">📸</div>
+                            <div style="font-size:.85rem;font-weight:600;color:var(--primary);">Tap to upload screenshot</div>
+                            <div style="font-size:.72rem;color:var(--muted);">JPG, PNG — max 5MB</div>
+                            <input type="file" id="ssFile" name="resolution_screenshot" accept="image/*" style="display:none;" onchange="previewSS(this)">
+                        </div>
+                        <div id="ssPreview" style="display:none;margin-top:.75rem;">
+                            <img id="ssPreviewImg" src="" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover;border:1px solid var(--card-border);">
+                            <button type="button" onclick="removeSS()" style="margin-top:.4rem;width:100%;background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:.4rem;font-size:.82rem;font-weight:700;cursor:pointer;font-family:inherit;">🗑 Remove Photo</button>
+                        </div>
                     </div>
+                    <button type="button" onclick="openConfirm()" class="btn btn-primary" style="width:100%;justify-content:center;">
+                        <i data-lucide="check-square"></i> Finalize & Mark as Completed
+                    </button>
                 </form>
+
+                <!-- 2nd Authenticator Modal -->
+                <div id="confirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:300;align-items:center;justify-content:center;padding:1rem;">
+                    <div style="background:white;border-radius:20px;padding:2rem;max-width:420px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.2);">
+                        <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem;">
+                            <div style="width:40px;height:40px;background:#fef9c3;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">⚠️</div>
+                            <div>
+                                <div style="font-family:'Fraunces',serif;font-size:1.1rem;font-weight:700;">Confirm Resolution</div>
+                                <div style="font-size:.8rem;color:var(--muted);">Please verify before finalizing</div>
+                            </div>
+                            <button onclick="closeConfirm()" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.25rem;">✕</button>
+                        </div>
+
+                        <div style="background:var(--background);border-radius:12px;padding:1rem;margin-bottom:1rem;">
+                            <div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.6rem;">Payment Reference</div>
+                            <div id="cfm-ref" style="font-size:1rem;font-weight:700;color:var(--primary);font-family:monospace;">—</div>
+                        </div>
+
+                        <div id="cfm-photo-wrap" style="display:none;margin-bottom:1rem;">
+                            <div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.5rem;">Payment Screenshot</div>
+                            <img id="cfm-photo" src="" style="width:100%;border-radius:10px;max-height:180px;object-fit:cover;border:1px solid var(--card-border);">
+                        </div>
+
+                        <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:.75rem 1rem;font-size:.82rem;color:#991b1b;margin-bottom:1.25rem;">
+                            ⚠ This action is <strong>irreversible</strong>. The return will be marked as Completed and the franchisee will be notified.
+                        </div>
+
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;">
+                            <button onclick="closeConfirm()" style="padding:.875rem;border-radius:12px;border:1.5px solid var(--card-border);background:white;font-weight:700;font-family:inherit;cursor:pointer;">← Go Back</button>
+                            <button onclick="submitForm()" style="padding:.875rem;border-radius:12px;background:#166534;color:white;border:none;font-weight:700;font-family:inherit;cursor:pointer;">✓ Confirm & Finalize</button>
+                        </div>
+                    </div>
+                </div>
 
                 <?php elseif ($selectedReturn['status'] === 'Resolved'): ?>
                 <div style="background:#f0fdf4;border-radius:12px;padding:1.25rem;text-align:center;color:#166534;">
@@ -327,6 +397,14 @@ $conn->close();
                     <strong>Case Resolved</strong><br>
                     <span style="font-size:.85rem;">Resolved on <?php echo $selectedReturn['resolved_at'] ? date('M d, Y h:i A', strtotime($selectedReturn['resolved_at'])) : '—'; ?></span>
                 </div>
+                <?php if (!empty($selectedReturn['resolution_photo'])): ?>
+                <div style="margin-top:1rem;">
+                    <div style="font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.5rem;">Resolution Screenshot</div>
+                    <img src="<?php echo htmlspecialchars($selectedReturn['resolution_photo']); ?>" alt="Resolution Screenshot"
+                        style="width:100%;border-radius:10px;border:1px solid var(--card-border);cursor:zoom-in;max-height:200px;object-fit:contain;"
+                        onclick="window.open(this.src,'_blank')" title="Click to open full size">
+                </div>
+                <?php endif; ?>
 
                 <?php else: ?>
                 <div style="background:#fffbeb;border-radius:12px;padding:1.25rem;text-align:center;color:#b45309;">
@@ -359,6 +437,82 @@ $conn->close();
         </div>
     </div>
 </main>
-<script>lucide.createIcons();</script>
+<script>
+lucide.createIcons();
+
+function previewSS(input) {
+    if (!input.files || !input.files[0]) return;
+    if (input.files[0].size > 5 * 1024 * 1024) {
+        alert('File too large. Max 5MB.');
+        input.value = '';
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = e => {
+        document.getElementById('ssPreviewImg').src = e.target.result;
+        document.getElementById('ssPreview').style.display = 'block';
+        document.getElementById('ssUploadBox').style.borderColor = 'var(--primary)';
+    };
+    reader.readAsDataURL(input.files[0]);
+}
+
+function removeSS() {
+    document.getElementById('ssFile').value = '';
+    document.getElementById('ssPreviewImg').src = '';
+    document.getElementById('ssPreview').style.display = 'none';
+    document.getElementById('ssUploadBox').style.borderColor = 'var(--card-border)';
+}
+
+function openConfirm() {
+    // Validate ref number first
+    const ref = document.querySelector('input[name="payment_ref"]');
+    if (!ref || !ref.value.trim()) {
+        ref.focus();
+        ref.style.borderColor = '#ef4444';
+        setTimeout(() => ref.style.borderColor = '', 2000);
+        alert('Please enter a payment reference number first.');
+        return;
+    }
+
+    // Populate modal with ref and photo
+    document.getElementById('cfm-ref').textContent = ref.value.trim();
+
+    const previewImg = document.getElementById('ssPreviewImg');
+    const photoWrap  = document.getElementById('cfm-photo-wrap');
+    if (previewImg && previewImg.src && previewImg.src !== window.location.href) {
+        document.getElementById('cfm-photo').src = previewImg.src;
+        photoWrap.style.display = 'block';
+    } else {
+        photoWrap.style.display = 'none';
+    }
+
+    const modal = document.getElementById('confirmModal');
+    modal.style.display = 'flex';
+    lucide.createIcons();
+}
+
+function closeConfirm() {
+    document.getElementById('confirmModal').style.display = 'none';
+}
+
+function submitForm() {
+    closeConfirm();
+    // Add hidden action input and submit the form
+    const form = document.querySelector('form[enctype="multipart/form-data"]');
+    if (!form) return;
+    const btn = document.createElement('input');
+    btn.type  = 'hidden';
+    btn.name  = 'action';
+    btn.value = 'resolve';
+    form.appendChild(btn);
+    form.submit();
+}
+
+// Close modal on backdrop click
+document.addEventListener('click', function(e) {
+    const modal = document.getElementById('confirmModal');
+    if (modal && e.target === modal) closeConfirm();
+});
+</script>
 </body>
 </html>

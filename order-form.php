@@ -27,6 +27,79 @@ $franchisee   = getFranchiseeByUser($conn, $userId);
 $franchiseeId = $franchisee['id']          ?? null;
 $branchName   = $franchisee['branch_name'] ?? 'Your Branch';
 
+// ── Usage handoff from item-usage.php "Send to Order Form" ───
+// Reads items saved in $_SESSION['usage_handoff'] by item-usage.php AJAX.
+// These get injected into JS as usageHandoffItems so restoreDraft can
+// pre-populate the form — no localStorage dependency needed.
+$usageHandoffItems = [];
+if (isset($_GET['from_usage']) && !empty($_SESSION['usage_handoff'])) {
+    $h = $_SESSION['usage_handoff'];
+    if (isset($h['ts']) && (time() - $h['ts']) < 600) {
+        $usageHandoffItems = $h['items'] ?? [];
+    }
+    unset($_SESSION['usage_handoff']); // one-time read
+}
+
+// ── Edit payment mode: ?edit_payment=ORDER_ID ────────────────
+$editPaymentId    = intval($_GET['edit_payment'] ?? $_POST['edit_payment_id'] ?? 0);
+$editPaymentOrder = null;
+
+if ($editPaymentId && $franchiseeId) {
+    $stmt = $conn->prepare("SELECT id, po_number, payment_method, payment_ref, payment_proof, status FROM orders WHERE id = ? AND franchisee_id = ? AND status = 'Under Review'");
+    $stmt->bind_param("ii", $editPaymentId, $franchiseeId);
+    $stmt->execute();
+    $editPaymentOrder = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+}
+
+// ── Handle payment-only update POST ──────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_payment_id']) && $franchiseeId) {
+    $epId = intval($_POST['edit_payment_id']);
+    // verify ownership
+    $chk = $conn->prepare("SELECT id, po_number FROM orders WHERE id = ? AND franchisee_id = ? AND status = 'Under Review'");
+    $chk->bind_param("ii", $epId, $franchiseeId);
+    $chk->execute();
+    $epOrder = $chk->get_result()->fetch_assoc();
+    $chk->close();
+
+    if ($epOrder) {
+        $newRef   = trim($_POST['payment_ref'] ?? '');
+        $newProof = null;
+
+        if (!empty($_FILES['payment_screenshot']['tmp_name']) && $_FILES['payment_screenshot']['error'] === UPLOAD_ERR_OK) {
+            $uploadDir = __DIR__ . '/uploads/payment_screenshots/';
+            if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+            $ext     = strtolower(pathinfo($_FILES['payment_screenshot']['name'], PATHINFO_EXTENSION));
+            $allowed = ['jpg','jpeg','png','gif','webp'];
+            if (in_array($ext, $allowed) && $_FILES['payment_screenshot']['size'] <= 5 * 1024 * 1024) {
+                $safeName = 'proof_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+                if (move_uploaded_file($_FILES['payment_screenshot']['tmp_name'], $uploadDir . $safeName)) {
+                    $newProof = 'uploads/payment_screenshots/' . $safeName;
+                }
+            }
+        }
+
+        if ($newProof) {
+            $upd = $conn->prepare("UPDATE orders SET payment_ref = ?, payment_proof = ?, payment_status = 'unpaid' WHERE id = ?");
+            $upd->bind_param("ssi", $newRef, $newProof, $epId);
+        } else {
+            $upd = $conn->prepare("UPDATE orders SET payment_ref = ?, payment_status = 'unpaid' WHERE id = ?");
+            $upd->bind_param("si", $newRef, $epId);
+        }
+        $upd->execute();
+        $upd->close();
+
+        // Log resubmission to history
+        $ins = $conn->prepare("INSERT INTO order_status_history (order_id, status_step, status_label, detail, changed_at, changed_by) VALUES (?, 1, 'Under Review', 'Franchisee updated payment details and resubmitted.', NOW(), ?)");
+        $ins->bind_param("ii", $epId, $userId);
+        $ins->execute();
+        $ins->close();
+
+        header('Location: order-status.php?po=' . urlencode($epOrder['po_number']));
+        exit();
+    }
+}
+
 // ── Fetch all available products ─────────────────────────────
 $products = [];
 $prodResult = $conn->query("SELECT id, name, category, unit, price, stock_qty FROM products WHERE status = 'available' ORDER BY category, name");
@@ -39,8 +112,11 @@ $submitErr = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $franchiseeId) {
 
-    $delivery       = $_POST['delivery']        ?? 'Standard Delivery';
-    $deliveryFee    = ($delivery === 'Self Pickup') ? 0.00 : 250.00;
+    $delivery       = $_POST['delivery']        ?? 'Standard Delivery/motor';
+    $deliveryFee    = 0.00;
+    if ($delivery === 'Self Pickup') $deliveryFee = 0.00;
+    elseif ($delivery === 'Standard Delivery/Sedan') $deliveryFee = 450.00;
+    else $deliveryFee = 250.00;
     $paymentMethod  = $_POST['payment_method']   ?? 'Cash';
     $productIds     = $_POST['product_id'] ?? [];
     $quantities     = $_POST['quantity']   ?? [];
@@ -424,7 +500,7 @@ $conn->close();
 <aside>
     <div class="logo-container">
         <div class="logo-icon"><i data-lucide="coffee"></i></div>
-        <div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div>
+        <div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div>
     </div>
     <div class="menu-label">Menu</div>
     <nav>
@@ -433,7 +509,7 @@ $conn->close();
         <a href="item-usage.php" class="nav-item"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile">
@@ -448,6 +524,94 @@ $conn->close();
 
 <!-- ── Main Content ── -->
 <main>
+    <?php if ($editPaymentOrder): ?>
+    <!-- ── Edit Payment Mode (flagged order) ── -->
+    <div class="header">
+        <h2>Update Payment Details</h2>
+        <p>Your payment was flagged. Correct your reference number or screenshot below and resubmit.</p>
+    </div>
+    <div style="max-width:520px;margin:0 auto;">
+        <div style="background:#fef2f2;border:1.5px solid #fca5a5;border-radius:14px;padding:1rem 1.25rem;margin-bottom:1.5rem;font-size:.9rem;color:#7f1d1d;">
+            <strong>Order:</strong> <?php echo htmlspecialchars($editPaymentOrder['po_number']); ?> &nbsp;·&nbsp;
+            <strong>Status:</strong> Under Review
+        </div>
+        <div class="card" style="padding:2rem;">
+            <form method="POST" action="order-form.php" enctype="multipart/form-data">
+                <input type="hidden" name="edit_payment_id" value="<?php echo $editPaymentOrder['id']; ?>">
+
+                <div style="margin-bottom:1.25rem;">
+                    <label style="display:block;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.5rem;">Reference / Transaction Number</label>
+                    <input type="text" name="payment_ref"
+                           value="<?php echo htmlspecialchars($editPaymentOrder['payment_ref'] ?? ''); ?>"
+                           placeholder="Enter your GCash / bank reference number"
+                           style="width:100%;padding:.75rem 1rem;border:1.5px solid var(--card-border);border-radius:10px;font-family:inherit;font-size:.9rem;outline:none;">
+                </div>
+
+                <?php if (!empty($editPaymentOrder['payment_proof'])): ?>
+                <div style="margin-bottom:1rem;">
+                    <label style="display:block;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.5rem;">Current Screenshot</label>
+                    <img src="<?php echo htmlspecialchars($editPaymentOrder['payment_proof']); ?>"
+                         style="width:100%;border-radius:10px;max-height:180px;object-fit:cover;border:1px solid var(--card-border);cursor:pointer;"
+                         onclick="this.style.maxHeight=this.style.maxHeight==='none'?'180px':'none'">
+                    <p style="font-size:.72rem;color:var(--muted);margin-top:.3rem;">Click to expand</p>
+                </div>
+                <?php endif; ?>
+
+                <div style="margin-bottom:1.5rem;">
+                    <label style="display:block;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.5rem;">
+                        <?php echo !empty($editPaymentOrder['payment_proof']) ? 'Replace Screenshot (optional)' : 'Upload Payment Screenshot'; ?>
+                    </label>
+                    <div id="epUploadBox" style="border:2px dashed var(--card-border);border-radius:10px;padding:1.25rem;text-align:center;cursor:pointer;background:var(--background);transition:border-color .2s;"
+                         onclick="document.getElementById('epFile').click()"
+                         ondragover="event.preventDefault();this.style.borderColor='var(--primary)'"
+                         ondragleave="this.style.borderColor=''"
+                         ondrop="event.preventDefault();handleEpDrop(event)">
+                        <div style="font-size:1.5rem;margin-bottom:.3rem;">📸</div>
+                        <div style="font-size:.85rem;font-weight:600;color:var(--primary);">Tap to upload screenshot</div>
+                        <div style="font-size:.72rem;color:var(--muted);">JPG, PNG — max 5MB</div>
+                        <input type="file" id="epFile" name="payment_screenshot" accept="image/*" style="display:none;" onchange="previewEpFile(this)">
+                    </div>
+                    <div id="epPreview" style="display:none;margin-top:.75rem;">
+                        <img id="epPreviewImg" src="" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover;border:1px solid var(--card-border);">
+                        <button type="button" onclick="clearEpFile()" style="margin-top:.4rem;width:100%;background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:8px;padding:.4rem;font-size:.82rem;font-weight:700;cursor:pointer;font-family:inherit;">🗑 Remove</button>
+                    </div>
+                </div>
+
+                <div style="display:flex;gap:.75rem;">
+                    <a href="order-status.php" style="flex:1;padding:.875rem;border-radius:12px;border:1.5px solid var(--card-border);background:transparent;color:var(--muted);font-weight:700;font-size:.92rem;text-align:center;text-decoration:none;display:flex;align-items:center;justify-content:center;">← Go Back</a>
+                    <button type="submit" style="flex:1;padding:.875rem;border-radius:12px;background:var(--primary);color:white;font-weight:700;font-size:.92rem;border:none;cursor:pointer;font-family:inherit;">✓ Resubmit Payment</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <script>
+        function previewEpFile(input) {
+            if (!input.files || !input.files[0]) return;
+            if (input.files[0].size > 5*1024*1024) { alert('File too large. Max 5MB.'); input.value=''; return; }
+            const reader = new FileReader();
+            reader.onload = e => {
+                document.getElementById('epPreviewImg').src = e.target.result;
+                document.getElementById('epPreview').style.display = 'block';
+                document.getElementById('epUploadBox').style.borderColor = 'var(--primary)';
+            };
+            reader.readAsDataURL(input.files[0]);
+        }
+        function clearEpFile() {
+            document.getElementById('epFile').value = '';
+            document.getElementById('epPreview').style.display = 'none';
+            document.getElementById('epPreviewImg').src = '';
+            document.getElementById('epUploadBox').style.borderColor = '';
+        }
+        function handleEpDrop(e) {
+            const file = e.dataTransfer.files[0];
+            if (!file) return;
+            document.getElementById('epFile').files = e.dataTransfer.files;
+            previewEpFile(document.getElementById('epFile'));
+        }
+        lucide.createIcons();
+    </script>
+    <?php else: ?>
+    <!-- ── Normal new order form ── -->
     <div class="header">
         <h2>New Purchase Order</h2>
         <p>Select raw ingredients and supplies for your branch.</p>
@@ -496,41 +660,7 @@ $conn->close();
                         <span></span>
                     </div>
                     <div id="itemsContainer">
-                        <!-- First row (always present) -->
-                        <div class="item-row">
-                            <div class="form-group">
-                                <select class="input-control item-select" name="product_id[]" required onchange="onItemChange(this)">
-                                    <option value="" disabled selected>Select item</option>
-                                    <?php
-                                    $lastCat = '';
-                                    foreach ($products as $p):
-                                        if ($p['category'] !== $lastCat):
-                                            if ($lastCat !== '') echo '</optgroup>';
-                                            echo '<optgroup label="' . htmlspecialchars($p['category']) . '">';
-                                            $lastCat = $p['category'];
-                                        endif;
-                                    ?>
-                                        <option value="<?php echo $p['id']; ?>"
-                                                data-price="<?php echo $p['price']; ?>"
-                                                data-name="<?php echo htmlspecialchars($p['name']); ?>"
-                                                data-unit="<?php echo htmlspecialchars($p['unit']); ?>"
-                                                data-stock="<?php echo intval($p['stock_qty']); ?>"
-                                                <?php if (intval($p['stock_qty']) === 0): ?>style="color:#991b1b;" disabled <?php endif; ?>>
-                                            <?php echo htmlspecialchars($p['name']); ?> (<?php echo htmlspecialchars($p['unit']); ?>) — ₱<?php echo number_format($p['price'], 2); ?><?php echo intval($p['stock_qty']) === 0 ? ' — OUT OF STOCK' : ' | Stock: ' . intval($p['stock_qty']); ?>
-                                        </option>
-                                    <?php endforeach; if ($lastCat !== '') echo '</optgroup>'; ?>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <input type="number" class="input-control item-qty" name="quantity[]" value="1" min="1" required oninput="onQtyChange(this)">
-                            </div>
-                            <div class="form-group">
-                                <input type="text" class="input-control item-subtotal" value="₱0.00" readonly>
-                            </div>
-                            <button type="button" class="btn-remove" onclick="removeRow(this)" title="Remove item">
-                                <i data-lucide="trash-2" size="18"></i>
-                            </button>
-                        </div>
+                        <!-- Rows are injected by JS: restored from draft, from item-usage handoff, or via "+ Add Another Item" -->
                     </div>
                     <button type="button" class="btn-add-row" onclick="addItemRow()">
                         + Add Another Item
@@ -540,26 +670,27 @@ $conn->close();
                 <!-- Delivery Preference -->
                 <div class="card">
                     <h3 class="section-title"><i data-lucide="truck"></i> Delivery Preference</h3>
+                    <p style="font-size:.8rem;color:var(--muted);margin-bottom:1rem;">The recommended option will be auto-selected based on your order weight. You can always change it.</p>
                     <div class="radio-group">
                         <label class="radio-option">
-                            <input type="radio" name="delivery" value="Standard Delivery" checked onchange="onDeliveryChange()">
+                            <input type="radio" name="delivery" value="Standard Delivery/motor" checked onchange="onDeliveryChange()">
                             <span class="radio-label">
-                                <span class="radio-title">Standard Delivery</span>
-                                <span class="radio-sub">2–3 Days • ₱250</span>
+                                <span class="radio-title">Standard Delivery/motor</span>
+                                <span class="radio-sub">₱250 · Up to 20 kg</span>
                             </span>
                         </label>
                         <label class="radio-option">
-                            <input type="radio" name="delivery" value="Priority Delivery" onchange="onDeliveryChange()">
+                            <input type="radio" name="delivery" value="Standard Delivery/Sedan" onchange="onDeliveryChange()">
                             <span class="radio-label">
-                                <span class="radio-title">Priority</span>
-                                <span class="radio-sub">Next Day • ₱250</span>
+                                <span class="radio-title">Standard Delivery/Sedan</span>
+                                <span class="radio-sub">₱400–500 · Up to 200 kg</span>
                             </span>
                         </label>
                         <label class="radio-option">
                             <input type="radio" name="delivery" value="Self Pickup" onchange="onDeliveryChange()">
                             <span class="radio-label">
                                 <span class="radio-title">Self Pickup</span>
-                                <span class="radio-sub">Same Day • Free</span>
+                                <span class="radio-sub">Free · Same Day</span>
                             </span>
                         </label>
                     </div>
@@ -614,6 +745,18 @@ $conn->close();
                     <!-- Item lines (updated live by JS) -->
                     <div class="summary-items" id="sumItems">
                         <div class="summary-empty" id="sumEmpty">No items selected yet.</div>
+                    </div>
+
+                    <!-- Estimated weight + delivery suggestion -->
+                    <div id="weightRow" style="display:none;background:#fdf8f5;border:1px solid var(--card-border);border-radius:10px;padding:.65rem 1rem;margin-bottom:.75rem;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <span style="font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);">Est. Total Weight</span>
+                            <span id="sumWeight" style="font-weight:700;font-size:.95rem;color:var(--primary);">0 kg</span>
+                        </div>
+                        <div id="deliverySuggestion" style="font-size:.75rem;margin-top:.35rem;color:#92400e;display:none;">
+                            <i data-lucide="truck" size="12" style="vertical-align:middle;margin-right:.25rem;"></i>
+                            <span id="suggestionText"></span>
+                        </div>
                     </div>
 
                     <!-- Delivery method -->
@@ -671,6 +814,7 @@ $conn->close();
         <?php endforeach; if ($lastCatT !== '') echo '</optgroup>'; ?>
     </select>
     </form>
+    <?php endif; // end edit payment mode else ?>
 </main>
 
 <!-- ── Order Review Modal (double-check before submitting) ── -->
@@ -837,32 +981,65 @@ $conn->close();
     }
 
     function onDeliveryChange() {
-        const val = document.querySelector('input[name="delivery"]:checked')?.value || 'Standard Delivery';
+        const val = document.querySelector('input[name="delivery"]:checked')?.value || 'Standard Delivery/motor';
         document.getElementById('sumDelivery').innerText = val;
-        document.getElementById('sumFee').innerText = (val === 'Self Pickup') ? '₱0.00' : '₱250.00';
+        let fee = 250;
+        if (val === 'Self Pickup') fee = 0;
+        else if (val === 'Standard Delivery/Sedan') fee = 450; // mid-range of ₱400-500
+        document.getElementById('sumFee').innerText = fmt(fee);
         refreshSummary();
+    }
+
+    // ── Unit-to-kg conversion table ───────────────────────────
+    // Based on business rules: Motor ≤20kg, Sedan ≤200kg
+    function unitToKg(unit, qty) {
+        if (!unit) return 0;
+        const u = unit.toString().toLowerCase().trim();
+        // Weight units
+        if (u.includes('kg'))  return qty * parseFloat(u);        // "1kg","2kg","2.5kg"
+        if (u.includes('g') && !u.includes('kg')) {
+            const g = parseFloat(u); return qty * (g / 1000);      // "500g","400g"
+        }
+        // Volume units — approximate density 1L≈1kg for syrups/liquids
+        if (u.includes('l') && !u.includes('ml')) {
+            const l = parseFloat(u); return qty * l;               // "2L","2.5L"
+        }
+        if (u.includes('ml')) {
+            const ml = parseFloat(u); return qty * (ml / 1000);    // "500ml"
+        }
+        // Countable items (pcs, pc) — approximate 0.1kg each
+        if (u.includes('pc') || u.includes('pcs')) return qty * 0.1;
+        return 0;
+    }
+
+    function getDeliveryFee(deliveryVal) {
+        if (deliveryVal === 'Self Pickup')            return 0;
+        if (deliveryVal === 'Standard Delivery/Sedan') return 450;
+        return 250; // motor / default
     }
 
     function refreshSummary() {
         const rows     = document.querySelectorAll('.item-row');
         const itemsDiv = document.getElementById('sumItems');
-        const emptyMsg = document.getElementById('sumEmpty');
-        const delivery = document.querySelector('input[name="delivery"]:checked')?.value || 'Standard Delivery';
-        const fee      = (delivery === 'Self Pickup') ? 0 : 250;
+        const delivery = document.querySelector('input[name="delivery"]:checked')?.value || 'Standard Delivery/motor';
+        const fee      = getDeliveryFee(delivery);
 
-        let subtotal  = 0;
-        let itemsHTML = '';
-        let hasItems  = false;
+        let subtotal   = 0;
+        let itemsHTML  = '';
+        let hasItems   = false;
+        let totalKg    = 0;
 
         rows.forEach(row => {
             const sel   = row.querySelector('.item-select');
             const opt   = sel.options[sel.selectedIndex];
             const qty   = parseInt(row.querySelector('.item-qty').value) || 0;
             const price = parseFloat(opt?.dataset?.price || 0);
+            const unit  = opt?.dataset?.unit || '';
             if (!price || !qty) return;
-            hasItems = true;
+            hasItems   = true;
             const lineSub = price * qty;
-            subtotal += lineSub;
+            subtotal  += lineSub;
+            totalKg   += unitToKg(unit, qty);
             itemsHTML += `
                 <div class="summary-item-row">
                     <span class="summary-item-name">${opt.dataset.name} ×${qty}</span>
@@ -871,28 +1048,80 @@ $conn->close();
         });
 
         // Rebuild items list
-        // Remove old item rows but keep the empty message element
         itemsDiv.innerHTML = '';
         if (hasItems) {
             itemsDiv.innerHTML = itemsHTML;
-            if (emptyMsg) emptyMsg.style.display = 'none';
+            if (document.getElementById('sumEmpty')) document.getElementById('sumEmpty').style.display = 'none';
         } else {
             itemsDiv.innerHTML = '<div class="summary-empty" id="sumEmpty">No items selected yet.</div>';
         }
 
+        // ── Weight display ─────────────────────────────────────
+        const weightRow  = document.getElementById('weightRow');
+        const sumWeight  = document.getElementById('sumWeight');
+        const suggestion = document.getElementById('deliverySuggestion');
+        const suggText   = document.getElementById('suggestionText');
+
+        if (hasItems) {
+            weightRow.style.display = 'block';
+            const kgLabel = totalKg < 1
+                ? (totalKg * 1000).toFixed(0) + ' g'
+                : totalKg.toFixed(2).replace(/\.?0+$/, '') + ' kg';
+            sumWeight.innerText = kgLabel;
+
+            // ── Auto-suggest delivery based on weight ──────────
+            // Motor: ≤20kg | Sedan: >20kg ≤200kg | Self Pickup: user's choice
+            let suggested = null;
+            if (totalKg > 20 && totalKg <= 200) {
+                suggested = 'Standard Delivery/Sedan';
+                suggText.innerText = `Order is ~${kgLabel} — Sedan delivery recommended (up to 200 kg, ₱400–500).`;
+            } else if (totalKg <= 20) {
+                suggested = 'Standard Delivery/motor';
+                suggText.innerText = totalKg > 0
+                    ? `Order is ~${kgLabel} — Motor delivery is suitable (up to 20 kg, ₱250).`
+                    : '';
+            } else if (totalKg > 200) {
+                suggested = null;
+                suggText.innerText = `⚠️ Order exceeds 200 kg (~${kgLabel}). Please contact the office to arrange special delivery.`;
+            }
+
+            if (suggText.innerText) {
+                suggestion.style.display = 'block';
+            } else {
+                suggestion.style.display = 'none';
+            }
+
+            // Auto-select the suggested delivery option (user can still change it)
+            if (suggested) {
+                const currentDelivery = document.querySelector('input[name="delivery"]:checked')?.value;
+                // Only auto-switch if the current choice doesn't match the weight-appropriate one
+                // AND the user hasn't already manually selected Sedan or Self Pickup
+                const autoSuggestRadio = document.querySelector(`input[name="delivery"][value="${suggested}"]`);
+                if (autoSuggestRadio && currentDelivery !== suggested && currentDelivery !== 'Self Pickup') {
+                    autoSuggestRadio.checked = true;
+                }
+            }
+        } else {
+            weightRow.style.display = 'none';
+            suggestion.style.display = 'none';
+        }
+
+        // Recalculate fee after possible delivery change
+        const finalDelivery = document.querySelector('input[name="delivery"]:checked')?.value || 'Standard Delivery/motor';
+        const finalFee      = getDeliveryFee(finalDelivery);
+
         // Update totals
         document.getElementById('sumSubtotal').innerText = fmt(subtotal);
-        document.getElementById('sumFee').innerText      = fmt(fee);
-        document.getElementById('sumTotal').innerText    = fmt(subtotal + fee);
-
-        // Update delivery label
-        document.getElementById('sumDelivery').innerText = delivery;
+        document.getElementById('sumFee').innerText      = fmt(finalFee);
+        document.getElementById('sumTotal').innerText    = fmt(subtotal + finalFee);
+        document.getElementById('sumDelivery').innerText = finalDelivery;
     }
 
     function addItemRow() {
-        // Clone the options from the first select to reuse
-        const firstSelect  = document.querySelector('.item-row .item-select');
-        const optionsClone = firstSelect.innerHTML;
+        // Use template select for options (works even when container is empty)
+        const templateSelect = document.getElementById('productOptionsTemplate');
+        const firstSelect    = document.querySelector('.item-row .item-select');
+        const optionsClone   = (firstSelect || templateSelect).innerHTML;
 
         const tpl = `
         <div class="item-row">
@@ -915,8 +1144,8 @@ $conn->close();
         document.getElementById('itemsContainer').insertAdjacentHTML('beforeend', tpl);
 
         // Reset the new select to placeholder
-        const rows    = document.querySelectorAll('.item-row');
-        const newRow  = rows[rows.length - 1];
+        const rows   = document.querySelectorAll('.item-row');
+        const newRow = rows[rows.length - 1];
         newRow.querySelector('.item-select').selectedIndex = 0;
 
         lucide.createIcons();
@@ -925,17 +1154,6 @@ $conn->close();
     }
 
     function removeRow(btn) {
-        const rows = document.querySelectorAll('.item-row');
-        if (rows.length <= 1) {
-            const row = btn.closest('.item-row');
-            row.querySelector('.item-select').selectedIndex = 0;
-            row.querySelector('.item-qty').value = 1;
-            row.querySelector('.item-subtotal').value = '₱0.00';
-
-            updateAllDropdowns();
-            refreshSummary();
-            return;
-        }
         btn.closest('.item-row').remove();
         updateAllDropdowns();
         refreshSummary();
@@ -979,29 +1197,29 @@ $conn->close();
         } catch(e) {}
     }
 
-    // ── Check for item-usage handoff ────────────────────────────
-    const USAGE_HANDOFF_KEY = 'jc_usage_to_order_<?php echo (int)$franchiseeId; ?>';
+    // ── Item-usage handoff: written directly into DRAFT_KEY by item-usage.php ─
+    // The localStorage draft was already written before redirect — restoreDraft() below handles it.
+    // Session fallback is kept for environments where localStorage may be restricted.
+    const usageHandoffItems = <?php echo json_encode($usageHandoffItems); ?>;
     const fromUsage = new URLSearchParams(window.location.search).get('from_usage') === '1';
 
     if (fromUsage) {
-        // Clear URL param without reload
         history.replaceState({}, '', 'order-form.php');
-        // Load handoff items into the draft key so restoreDraft picks them up
-        try {
-            const handoff = JSON.parse(localStorage.getItem(USAGE_HANDOFF_KEY) || 'null');
-            if (handoff?.items?.length) {
-                // Check not stale (within 5 minutes)
-                if (Date.now() - (handoff.ts || 0) < 5 * 60 * 1000) {
-                    // Write into the draft key so restoreDraft handles it
+
+        // If session had data but localStorage draft wasn't written (rare fallback)
+        if (usageHandoffItems && usageHandoffItems.length > 0) {
+            try {
+                const existing = localStorage.getItem(DRAFT_KEY);
+                if (!existing) {
                     localStorage.setItem(DRAFT_KEY, JSON.stringify({
-                        items: handoff.items,
+                        items: usageHandoffItems.map(it => ({ pid: String(it.pid), qty: String(it.qty || 1) })),
                         delivery: 'Standard Delivery',
-                        payment: 'Cash',
+                        payment:  'Cash',
+                        ts: Date.now()
                     }));
                 }
-                localStorage.removeItem(USAGE_HANDOFF_KEY);
-            }
-        } catch(e) {}
+            } catch(e) {}
+        }
     }
 
     // Restore saved draft on page load
@@ -1072,12 +1290,67 @@ $conn->close();
     document.querySelectorAll('input[name="delivery"]').forEach(r => r.addEventListener('change', saveDraft));
     document.querySelectorAll('input[name="payment_method"]').forEach(r => r.addEventListener('change', saveDraft));
 
-    // Restore after page fully loads
-    setTimeout(restoreDraft, 100);
+    // Restore after page fully loads; if nothing to restore, add one empty row
+    setTimeout(() => {
+        _userPickedDelivery = false; // allow weight logic to auto-suggest on fresh load
+        restoreDraft();
+        // If still empty after restore (no draft, no handoff, fresh page), add one empty row
+        if (!wasSubmitted && document.querySelectorAll('.item-row').length === 0) {
+            addItemRow();
+        }
+    }, 100);
 
     // ── Payment method toggle ──────────────────────────────────
     function onPayChange(radio) {
         document.getElementById('sumPayment').innerText = radio.value;
+        // Set reference number character limit based on payment method
+        const refInput = document.getElementById('pcRefNumber');
+        if (!refInput) return;
+        if (radio.value === 'GCash') {
+            refInput.maxLength = 13;
+            refInput.placeholder = 'Enter your GCash reference number (13 digits)';
+        } else if (radio.value === 'Card') {
+            refInput.maxLength = 18;
+            refInput.placeholder = 'Enter your bank reference number (up to 18 characters)';
+        } else {
+            refInput.removeAttribute('maxlength');
+            refInput.placeholder = 'Enter your reference number';
+        }
+        updateRefCounter();
+    }
+
+    function toggleAccounts(bodyId, chevronId) {
+        const body    = document.getElementById(bodyId);
+        const chevron = document.getElementById(chevronId);
+        const isOpen  = body.style.display !== 'none';
+        body.style.display    = isOpen ? 'none' : 'flex';
+        chevron.style.transform = isOpen ? 'rotate(0deg)' : 'rotate(180deg)';
+    }
+
+    function copyToClip(text, el) {
+        navigator.clipboard.writeText(text).then(() => {
+            const hint = el.querySelector('span:last-child');
+            if (hint) { const orig = hint.textContent; hint.textContent = '✓ Copied!'; hint.style.color = '#059669'; setTimeout(() => { hint.textContent = orig; hint.style.color = ''; }, 1500); }
+        }).catch(() => {
+            // fallback for older browsers
+            const ta = document.createElement('textarea');
+            ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+            const hint = el.querySelector('span:last-child');
+            if (hint) { const orig = hint.textContent; hint.textContent = '✓ Copied!'; hint.style.color = '#059669'; setTimeout(() => { hint.textContent = orig; hint.style.color = ''; }, 1500); }
+        });
+    }
+
+    function updateRefCounter() {
+        const refInput  = document.getElementById('pcRefNumber');
+        const lenEl     = document.getElementById('refLen');
+        const maxEl     = document.getElementById('refMax');
+        if (!refInput || !lenEl || !maxEl) return;
+        const max = refInput.maxLength > 0 ? refInput.maxLength : '—';
+        lenEl.textContent = refInput.value.length;
+        maxEl.textContent = max;
+        // Turn red when at limit
+        const counter = document.getElementById('refCounter');
+        if (counter) counter.style.color = (refInput.value.length >= refInput.maxLength && refInput.maxLength > 0) ? '#ef4444' : 'var(--muted)';
     }
 
     // ── Open Review Modal: populate then show ─────────────────
@@ -1153,17 +1426,17 @@ $conn->close();
         const proceedBtn = document.getElementById('reviewProceedBtn');
         if (proceedBtn) proceedBtn.textContent = (method === 'Cash') ? '✓ Confirm & Submit' : '→ Confirm & Payment';
 
-        document.getElementById('reviewModal').classList.add('open');
+        document.getElementById('reviewModal').style.display='flex';
         lucide.createIcons();
     }
 
     function closeReview() {
-        document.getElementById('reviewModal').classList.remove('open');
+        document.getElementById('reviewModal').style.display='none';
     }
 
     function submitConfirmed() {
         try { localStorage.removeItem(DRAFT_KEY); } catch(e) {}
-        document.getElementById('reviewModal').classList.remove('open');
+        document.getElementById('reviewModal').style.display='none';
         document.getElementById('orderForm').submit();
     }
 
@@ -1247,7 +1520,7 @@ $conn->close();
 
     function startPayTimer() {
         if (window._timerInt) clearInterval(window._timerInt);
-        window._timerEnd = Date.now() + 300000; // 5 min in ms
+        window._timerEnd = Date.now() + 60000; // 1 min in ms
 
         window._timerInt = setInterval(function() {
             var now  = Date.now();
@@ -1256,21 +1529,20 @@ $conn->close();
             var sec  = Math.ceil(ms / 1000);
             var m    = Math.floor(sec / 60);
             var s    = sec % 60;
-            var pct  = (ms / 300000 * 100);
+            var pct  = (ms / 60000 * 100);
 
-            var el = document.getElementById('pcTimerDigits');
-            var bar = document.getElementById('pcTimerFill');
+            var el   = document.getElementById('pcTimerDigits');
+            var bar  = document.getElementById('pcTimerFill');
             var wrap = document.getElementById('pcTimerBar');
 
             if (el)   el.textContent = m + ':' + (s < 10 ? '0' : '') + s;
-            if (bar)  { bar.style.width = pct + '%'; bar.style.background = sec <= 60 ? '#dc2626' : sec <= 120 ? '#f59e0b' : '#5c4033'; }
-            if (wrap) { if (sec <= 60) wrap.classList.add('urgent'); else wrap.classList.remove('urgent'); }
+            if (bar)  { bar.style.width = pct + '%'; bar.style.background = sec <= 15 ? '#dc2626' : sec <= 30 ? '#f59e0b' : '#5c4033'; }
+            if (wrap) { if (sec <= 15) wrap.classList.add('urgent'); else wrap.classList.remove('urgent'); }
 
             if (ms <= 0) {
                 clearInterval(window._timerInt);
                 window._timerInt = null;
-                closePayConfirm();
-                setTimeout(function() { alert('Time expired. Please try again.'); }, 200);
+                window._yesGoBack();
             }
         }, 1000);
     }
@@ -1279,7 +1551,7 @@ $conn->close();
         if (window._timerInt) { clearInterval(window._timerInt); window._timerInt = null; }
         var el  = document.getElementById('pcTimerDigits');
         var bar = document.getElementById('pcTimerFill');
-        if (el)  el.textContent = '5:00';
+        if (el)  el.textContent = '1:00';
         if (bar) { bar.style.width = '100%'; bar.style.background = '#5c4033'; }
     }
 
@@ -1317,17 +1589,46 @@ $conn->close();
         const note = document.getElementById('pcRequiredNote');
         if (note) note.style.display = 'none';
         // Show modal
-        document.getElementById('payConfirmModal').classList.add('open');
+        // Show payment accounts based on method
+        const gcashAccounts = document.getElementById('pcAccountsGcash');
+        const cardAccounts  = document.getElementById('pcAccountsCard');
+        if (gcashAccounts) gcashAccounts.style.display = method === 'GCash' ? 'block' : 'none';
+        if (cardAccounts)  cardAccounts.style.display  = method === 'Card'  ? 'block' : 'none';
+
+        document.getElementById('payConfirmModal').style.display = 'flex';
         lucide.createIcons();
         startPayTimer();
     }
 
+    // ── Go-back attempt tracking ───────────────────────────────
+    let _goBackAttempts = 0;
+    const GO_BACK_WARN_THRESHOLD = 3;
+
     function closePayConfirm() {
-        document.getElementById('payConfirmModal').classList.remove('open');
-        stopPayTimer();
-        // Don't clear the screenshot on close — user may have uploaded correctly
-        // Only clear if they explicitly click Remove Photo
+        document.getElementById('goBackModal').style.display = 'flex';
     }
+
+    function closeGoBackModal() {
+        document.getElementById('goBackModal').style.display = 'none';
+    }
+
+    function confirmGoBack() {
+        _goBackAttempts++;
+        if (_goBackAttempts >= GO_BACK_WARN_THRESHOLD) {
+            document.getElementById('goBackModal').style.display = 'none';
+            const msg = document.getElementById('strikesMsg');
+            if (msg) msg.innerHTML = `You've gone back from the payment screen <strong>${_goBackAttempts} times</strong>. If you're having trouble, please contact support or try a different payment method.`;
+            document.getElementById('goBackStrikesModal').style.display = 'flex';
+            return;
+        }
+        window._yesGoBack();
+    }
+
+    function dismissStrikesAndGoBack() {
+        window._yesGoBack();
+    }
+
+    function doGoBack() { window._yesGoBack(); }
 
     document.getElementById('payConfirmModal').addEventListener('click', function(e) {
         if (e.target === this) closePayConfirm();
@@ -1459,7 +1760,7 @@ $conn->close();
         <div class="pc-timer-bar" id="pcTimerBar">
             <i data-lucide="clock" size="13"></i>
             <span>Time remaining:</span>
-            <span class="pc-timer-digits" id="pcTimerDigits">5:00</span>
+            <span class="pc-timer-digits" id="pcTimerDigits">1:00</span>
         </div>
         <div class="pc-timer-track">
             <div class="pc-timer-fill" id="pcTimerFill" style="width:100%;"></div>
@@ -1472,10 +1773,68 @@ $conn->close();
             <div class="payconfirm-row"><span class="pc-label">Payment Method</span><span class="pc-value" id="pc-method">—</span></div>
         </div>
 
+        <!-- Payment Accounts — shows relevant accounts based on method -->
+        <div id="pcAccountsGcash" style="display:none;margin-bottom:1rem;">
+            <button type="button" onclick="toggleAccounts('gcashBody','gcashChevron')"
+                style="width:100%;display:flex;justify-content:space-between;align-items:center;padding:.6rem .9rem;background:#059669;color:white;border:none;border-radius:10px;cursor:pointer;font-size:.82rem;font-weight:700;font-family:inherit;">
+                <span>📱 Send Payment To — GCash Accounts</span>
+                <span id="gcashChevron" style="font-size:.7rem;transition:transform .2s;">▼</span>
+            </button>
+            <div id="gcashBody" style="display:none;border:1.5px solid #d1fae5;border-top:none;border-radius:0 0 10px 10px;background:#f0fdf4;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.6rem;">
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #d1fae5;cursor:pointer;" onclick="copyToClip('0935-961-1838',this)">
+                    <div><div style="font-size:.82rem;font-weight:700;">Denise Olive C.</div><div style="font-size:.78rem;color:#059669;font-family:monospace;font-weight:600;">0935-961-1838</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #d1fae5;cursor:pointer;" onclick="copyToClip('0917-638-9488',this)">
+                    <div><div style="font-size:.82rem;font-weight:700;">James Casimero</div><div style="font-size:.78rem;color:#059669;font-family:monospace;font-weight:600;">0917-638-9488</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="pcAccountsCard" style="display:none;margin-bottom:1rem;">
+            <button type="button" onclick="toggleAccounts('cardBody','cardChevron')"
+                style="width:100%;display:flex;justify-content:space-between;align-items:center;padding:.6rem .9rem;background:#1d4ed8;color:white;border:none;border-radius:10px;cursor:pointer;font-size:.82rem;font-weight:700;font-family:inherit;">
+                <span>🏦 Send Payment To — Bank Accounts</span>
+                <span id="cardChevron" style="font-size:.7rem;transition:transform .2s;">▼</span>
+            </button>
+            <div id="cardBody" style="display:none;border:1.5px solid #bfdbfe;border-top:none;border-radius:0 0 10px 10px;background:#eff6ff;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.6rem;">
+                <!-- Personal -->
+                <div style="font-size:.7rem;font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:.04em;padding:.2rem 0;">James Casimero</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('0084-9800-4002',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">BDO</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1d4ed8;">0084-9800-4002</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('3519-0484-76',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">BPI</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1d4ed8;">3519-0484-76</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('0000-01607-0363',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">Security Bank</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1d4ed8;">0000-01607-0363</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <!-- Corporate -->
+                <div style="font-size:.7rem;font-weight:700;color:#1e40af;text-transform:uppercase;letter-spacing:.04em;padding:.2rem 0;margin-top:.25rem;">Top Juan Franchising Inc.</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('0012-7805-9889',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">BDO</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1e40af;">0012-7805-9889</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('3511-0014-89',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">BPI</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1e40af;">3511-0014-89</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .75rem;background:white;border-radius:8px;border:1px solid #bfdbfe;cursor:pointer;" onclick="copyToClip('0000-0562-0597-9',this)">
+                    <div><div style="font-size:.78rem;font-weight:700;color:var(--muted);">Security Bank</div><div style="font-size:.82rem;font-family:monospace;font-weight:600;color:#1e40af;">0000-0562-0597-9</div></div>
+                    <span style="font-size:.7rem;color:var(--muted);">tap to copy</span>
+                </div>
+            </div>
+        </div>
+
         <!-- Reference number + screenshot upload -->
         <div class="payconfirm-fields">
             <label>Reference / Transaction Number <span style="color:#ef4444;">*</span></label>
-            <input type="text" id="pcRefNumber" placeholder="Enter your GCash / bank reference number" oninput="onPcFieldChange()">
+            <input type="text" id="pcRefNumber" maxlength="13" placeholder="Enter your GCash reference number (13 digits)" oninput="onPcFieldChange();updateRefCounter()">
+            <div id="refCounter" style="font-size:.72rem;color:var(--muted);text-align:right;margin-top:.2rem;"><span id="refLen">0</span>/<span id="refMax">13</span></div>
 
             <label>Payment Screenshot <span style="color:#ef4444;">*</span></label>
             <div class="pc-upload-box" id="pcUploadBox">
@@ -1507,5 +1866,93 @@ $conn->close();
     </div>
 </div>
 
+<!-- ── Go Back Confirmation Modal ── -->
+<div id="goBackModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);align-items:center;justify-content:center;z-index:900;padding:1rem;">
+    <div style="background:white;border-radius:20px;padding:2rem;max-width:360px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.25);text-align:center;">
+        <div style="font-size:2.2rem;margin-bottom:.75rem;">↩️</div>
+        <h3 style="font-family:'Fraunces',serif;font-size:1.2rem;margin-bottom:.6rem;">Go Back?</h3>
+        <p style="font-size:.88rem;color:#6b7280;line-height:1.6;margin-bottom:1.5rem;">
+            Your reference number and screenshot will need to be re-entered. Are you sure?
+        </p>
+        <div style="display:flex;gap:.75rem;justify-content:center;">
+            <button onclick="document.getElementById('goBackModal').style.display='none';" style="flex:1;padding:.85rem;border-radius:12px;border:1.5px solid #e5e7eb;background:white;font-weight:700;cursor:pointer;font-size:.9rem;color:#374151;">
+                Stay &amp; Finish
+            </button>
+            <button onclick="
+                window._goBackCount = (window._goBackCount || 0) + 1;
+                if (window._goBackCount >= 3) {
+                    document.getElementById('goBackModal').style.display='none';
+                    var m = document.getElementById('strikesMsg');
+                    if(m) m.innerHTML='You have gone back from the payment screen <strong>' + window._goBackCount + ' times</strong>. If you keep having trouble, please contact support or try a different payment method.';
+                    document.getElementById('goBackStrikesModal').style.display='flex';
+                } else {
+                    document.getElementById('goBackModal').style.display='none';
+                    document.getElementById('goBackStrikesModal').style.display='none';
+                    document.getElementById('payConfirmModal').style.display='none';
+                    document.getElementById('payConfirmModal').classList.remove('open');
+                    document.getElementById('reviewModal').style.display='none';
+                    document.getElementById('reviewModal').classList.remove('open');
+                    if(window._timerInt){clearInterval(window._timerInt);window._timerInt=null;}
+                }" style="flex:1;padding:.85rem;border-radius:12px;border:none;background:#92400e;color:white;font-weight:700;cursor:pointer;font-size:.9rem;">
+                Yes, Go Back
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- ── 3-Strikes Warning Modal ── -->
+<div id="goBackStrikesModal" style="position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);align-items:center;justify-content:center;z-index:950;padding:1rem;">
+    <div style="background:white;border-radius:20px;padding:2rem;max-width:400px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center;">
+        <div style="font-size:2.5rem;margin-bottom:.75rem;">⚠️</div>
+        <h3 style="font-family:'Fraunces',serif;font-size:1.2rem;color:#92400e;margin-bottom:.6rem;">Multiple Go-Backs Detected</h3>
+        <p id="strikesMsg" style="font-size:.88rem;color:#6b7280;line-height:1.65;margin-bottom:.75rem;">
+            You've gone back from payment multiple times. If you're having trouble completing your payment, please contact support or try a different payment method.
+        </p>
+        <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:12px;padding:.875rem 1rem;margin-bottom:1.25rem;font-size:.83rem;color:#92400e;text-align:left;line-height:1.6;">
+            <strong>Reminder:</strong> Make sure your GCash reference number is correct and your screenshot is clear before submitting.
+        </div>
+        <div style="display:flex;gap:.75rem;">
+            <button onclick="document.getElementById('goBackStrikesModal').style.display='none';" style="flex:1;padding:.8rem;border-radius:12px;border:1.5px solid #e5e7eb;background:white;font-weight:700;cursor:pointer;font-size:.88rem;color:#374151;">
+                ← Back to Payment
+            </button>
+            <button onclick="
+                document.getElementById('goBackStrikesModal').style.display='none';
+                document.getElementById('goBackModal').style.display='none';
+                document.getElementById('payConfirmModal').style.display='none';
+                document.getElementById('payConfirmModal').classList.remove('open');
+                document.getElementById('reviewModal').style.display='none';
+                document.getElementById('reviewModal').classList.remove('open');
+                if(window._timerInt){clearInterval(window._timerInt);window._timerInt=null;}
+                // Clear all product rows — franchisee must re-select their items
+                document.getElementById('itemsContainer').innerHTML = '';
+                try { localStorage.removeItem('jc_order_draft_<?php echo (int)$franchiseeId; ?>'); } catch(e) {}
+                if(typeof refreshSummary === 'function') refreshSummary();
+                if(typeof updateAllDropdowns === 'function') updateAllDropdowns();
+            " style="flex:1;padding:.8rem;border-radius:12px;border:none;background:#dc2626;color:white;font-weight:700;cursor:pointer;font-size:.88rem;">
+                Go Back Anyway
+            </button>
+        </div>
+    </div>
+</div>
+
+<style>
+#goBackModal, #goBackStrikesModal { display: none; }
+#goBackModal.open { display: flex !important; }
+#goBackStrikesModal.open { display: flex !important; }
+</style>
+
+<script>
+// Wire up window-level handlers AFTER DOM is ready — avoids any scope issues
+window._goBackCount = 0;
+window._backToPayment = function() { document.getElementById('goBackStrikesModal').style.display = 'none'; };
+window._yesGoBack     = function() {
+    // Hide every modal immediately
+    ['goBackModal','goBackStrikesModal','payConfirmModal','reviewModal'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) { el.style.display = 'none'; el.classList.remove('open'); }
+    });
+    if (typeof stopPayTimer === 'function') stopPayTimer();
+};
+</script>
 </body>
 </html>

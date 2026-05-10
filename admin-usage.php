@@ -20,31 +20,64 @@ $filter_franchisee = isset($_GET['franchisee']) ? intval($_GET['franchisee']) : 
 $filter_range      = isset($_GET['range'])      ? $_GET['range']              : 'all';
 $filter_search     = isset($_GET['search'])     ? trim($_GET['search'])       : '';
 
-// Date range
-$date_from = match($filter_range) {
-    '7'   => date('Y-m-d', strtotime('-7 days')),
-    '30'  => date('Y-m-d', strtotime('-30 days')),
-    '90'  => date('Y-m-d', strtotime('-90 days')),
-    'all' => '2000-01-01',
-    default => date('Y-m-d', strtotime('-30 days')),
-};
+$date_from = '2000-01-01';
 
-// ── STATS ─────────────────────────────────────────────────────────────────────
-$total_submissions = $conn->query("SELECT COUNT(*) c FROM item_usage WHERE recording_date >= '$date_from'")->fetch_assoc()['c'];
-$total_qty_used    = $conn->query("SELECT SUM(quantity_used) s FROM item_usage WHERE recording_date >= '$date_from'")->fetch_assoc()['s'] ?? 0;
-$active_branches   = $conn->query("SELECT COUNT(DISTINCT franchisee_id) c FROM item_usage WHERE recording_date >= '$date_from'")->fetch_assoc()['c'];
-$unique_items      = $conn->query("SELECT COUNT(DISTINCT product_id) c FROM item_usage WHERE recording_date >= '$date_from'")->fetch_assoc()['c'];
-
-// ── FRANCHISEE LIST for filter dropdown ──────────────────────────────────────
+// ── FRANCHISEE LIST — only accounts registered in the system ─
 $franchisee_res = $conn->query("
     SELECT f.id, f.branch_name,
            COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS franchisee_name
     FROM franchisees f
-    LEFT JOIN users u ON u.user_id = f.user_id
+    INNER JOIN users u ON u.user_id = f.user_id
+    WHERE f.user_id IS NOT NULL
     ORDER BY f.branch_name
 ");
 $franchisees = [];
 while ($f = $franchisee_res->fetch_assoc()) { $franchisees[] = $f; }
+
+// ── DEFAULTS — respects franchisee filter ────────────────────
+// When a franchisee is filtered: show only that branch (even if no defaults → empty state)
+// When no filter: show all registered branches that HAVE defaults
+$defaults_where = $filter_franchisee > 0
+    ? "AND f.id = {$filter_franchisee}"
+    : "";
+
+$defaults_res = $conn->query("
+    SELECT d.franchisee_id, d.quantity, d.unit,
+           p.name AS product_name, p.category,
+           f.branch_name,
+           COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS franchisee_name
+    FROM item_usage_defaults d
+    JOIN products    p ON p.id      = d.product_id
+    JOIN franchisees f ON f.id      = d.franchisee_id
+    JOIN users       u ON u.user_id = f.user_id
+    WHERE f.user_id IS NOT NULL {$defaults_where}
+    ORDER BY f.branch_name, p.name
+");
+$defaults_by_branch = [];
+while ($dr = $defaults_res->fetch_assoc()) {
+    $key = $dr['franchisee_id'];
+    if (!isset($defaults_by_branch[$key])) {
+        $defaults_by_branch[$key] = [
+            'branch_name'     => $dr['branch_name'],
+            'franchisee_name' => $dr['franchisee_name'],
+            'items'           => [],
+        ];
+    }
+    $defaults_by_branch[$key]['items'][] = $dr;
+}
+
+// When filtered to a specific franchisee that has no defaults, still show the empty state
+$filtered_branch_info = null;
+if ($filter_franchisee > 0 && empty($defaults_by_branch)) {
+    $fb = $conn->query("
+        SELECT f.branch_name,
+               COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS franchisee_name
+        FROM franchisees f
+        INNER JOIN users u ON u.user_id = f.user_id
+        WHERE f.id = {$filter_franchisee} LIMIT 1
+    ");
+    $filtered_branch_info = $fb ? $fb->fetch_assoc() : null;
+}
 
 // ── MAIN USAGE QUERY ─────────────────────────────────────────────────────────
 $where_parts = ["iu.recording_date >= '$date_from'"];
@@ -64,17 +97,17 @@ if ($filter_search !== '') {
 $where_sql = implode(' AND ', $where_parts);
 
 $sql = "
-    SELECT iu.id, iu.quantity_used, iu.unit, iu.recording_date, iu.submitted_at,
-           p.name AS product_name, p.category,
-           COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS franchisee_name,
-           f.branch_name,
-           o.po_number
+    SELECT iu.id, iu.usage_ref, iu.quantity_used, iu.unit, iu.recording_date, iu.submitted_at,
+           iu.is_default,
+           p.name AS product_name, p.category, p.product_code,
+           COALESCE(f.franchisee_name, u.full_name, f.branch_name, 'Unknown') AS franchisee_name,
+           f.branch_name
     FROM item_usage iu
     LEFT JOIN products    p ON iu.product_id    = p.id
     LEFT JOIN franchisees f ON iu.franchisee_id = f.id
     LEFT JOIN users       u ON u.user_id        = f.user_id
-    LEFT JOIN orders      o ON o.id             = iu.order_id
     WHERE $where_sql
+" . ($filter_franchisee === 0 ? " AND f.user_id IS NOT NULL" : "") . "
     ORDER BY iu.recording_date DESC, iu.submitted_at DESC, iu.id DESC
 ";
 
@@ -87,32 +120,161 @@ if ($types) {
     $usage_res = $conn->query($sql);
 }
 
-// ── TOP ITEMS by total quantity ───────────────────────────────────────────────
-$top_items_res = $conn->query("
-    SELECT p.name AS product_name, p.category, SUM(iu.quantity_used) AS total_qty, iu.unit,
-           COUNT(iu.id) AS submission_count
-    FROM item_usage iu
-    LEFT JOIN products p ON iu.product_id = p.id
-    WHERE iu.recording_date >= '$date_from'
-    GROUP BY iu.product_id, p.name, p.category, iu.unit
-    ORDER BY total_qty DESC
-    LIMIT 5
-");
-
-// ── TOP BRANCHES by submission count ─────────────────────────────────────────
-$top_branches_res = $conn->query("
-    SELECT COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS franchisee_name,
-           f.branch_name, COUNT(iu.id) AS submissions,
-           SUM(iu.quantity_used) AS total_qty
-    FROM item_usage iu
-    LEFT JOIN franchisees f ON iu.franchisee_id = f.id
-    LEFT JOIN users       u ON u.user_id        = f.user_id
-    WHERE iu.recording_date >= '$date_from'
-    GROUP BY iu.franchisee_id, f.branch_name, f.franchisee_name, u.full_name
-    ORDER BY submissions DESC
-    LIMIT 5
-");
 ?>
+<?php if (isset($_GET['ajax'])): ?>
+<?php
+// ── AJAX: output only the two swappable panels as JSON ───────
+ob_start();
+?>
+<!-- panel-defaults -->
+<div class="card">
+    <div class="card-header">
+        <h3><i data-lucide="bookmark" size="18" style="vertical-align:middle;margin-right:.4rem;color:var(--primary);"></i>
+            <?php echo $filter_franchisee > 0 ? 'Default Items' : 'Franchisee Default Items'; ?>
+        </h3>
+        <span><?php echo $filter_franchisee > 0 ? 'Locked defaults' : 'Select a branch'; ?></span>
+    </div>
+    <?php if ($filter_franchisee === 0): ?>
+        <p class="empty-state">
+            <i data-lucide="git-branch" size="32" style="display:block;margin:0 auto .75rem;opacity:.3;"></i>
+            Select a Franchisee<br>
+            <span style="font-size:.82rem;font-weight:400;">Choose a specific branch above to view its default items.</span>
+        </p>
+    <?php elseif (empty($defaults_by_branch)): ?>
+        <p class="empty-state">
+            <i data-lucide="inbox" size="32" style="display:block;margin:0 auto .75rem;opacity:.3;"></i>
+            No Default Items Yet<br>
+            <span style="font-size:.82rem;font-weight:400;">
+            <?php echo $filtered_branch_info
+                ? htmlspecialchars($filtered_branch_info['branch_name']) . " hasn't locked any default items yet."
+                : "This branch hasn't set any default items yet."; ?>
+            </span>
+        </p>
+    <?php else: ?>
+        <?php foreach ($defaults_by_branch as $fid => $ddata):
+            if (count($defaults_by_branch) > 1): ?>
+            <div style="padding:.5rem 1.5rem;background:var(--background);border-bottom:1px solid var(--card-border);font-size:.75rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">
+                <?php echo htmlspecialchars($ddata['branch_name']); ?>
+                <span style="font-weight:400;text-transform:none;"> — <?php echo htmlspecialchars($ddata['franchisee_name']); ?></span>
+            </div>
+            <?php endif; ?>
+            <div class="rank-list">
+            <?php $rank = 1; foreach ($ddata['items'] as $di): ?>
+            <div class="rank-item">
+                <div class="rank-num <?php echo $rank === 1 ? 'top' : ''; ?>"><?php echo $rank; ?></div>
+                <div class="rank-info">
+                    <h4><?php echo htmlspecialchars($di['product_name']); ?></h4>
+                    <p><?php echo htmlspecialchars($di['category']); ?></p>
+                </div>
+                <div class="rank-qty">
+                    <?php echo $di['quantity']; ?>
+                    <span><?php echo htmlspecialchars($di['unit']); ?></span>
+                </div>
+            </div>
+            <?php $rank++; endforeach; ?>
+            </div>
+        <?php endforeach; ?>
+    <?php endif; ?>
+</div>
+<?php
+$defaults_html = ob_get_clean();
+
+ob_start();
+?>
+<!-- panel-usage -->
+<div class="card">
+    <div class="card-header">
+        <h3>
+            <?php if ($filter_franchisee > 0):
+                $fn_res = $conn->query("SELECT COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS name FROM franchisees f LEFT JOIN users u ON u.user_id = f.user_id WHERE f.id = $filter_franchisee LIMIT 1");
+                $fn = $fn_res ? $fn_res->fetch_assoc() : null;
+            ?>
+                Usage Records — <span style="color:var(--primary);"><?= htmlspecialchars($fn['name'] ?? 'Franchisee') ?></span>
+            <?php else: ?>
+                All Usage Records
+            <?php endif; ?>
+        </h3>
+        <span style="display:flex;align-items:center;gap:.75rem;">
+            <?php if ($filter_franchisee > 0): ?>
+            <a href="#" onclick="clearFilter(event)" style="font-size:.8rem;color:var(--muted);text-decoration:none;display:flex;align-items:center;gap:.3rem;border:1px solid var(--card-border);padding:.25rem .75rem;border-radius:8px;">
+                <i data-lucide="x" size="13"></i> Clear filter
+            </a>
+            <?php endif; ?>
+            <?php
+            $row_count = $usage_res ? $usage_res->num_rows : 0;
+            echo $row_count . ' ' . ($row_count === 1 ? 'record' : 'records');
+            ?>
+        </span>
+    </div>
+    <?php if ($row_count > 0):
+        $grouped = [];
+        while ($row = $usage_res->fetch_assoc()) {
+            $d   = $row['recording_date'];
+            $ref = $row['usage_ref'] ?? '—';
+            if (!isset($grouped[$d])) $grouped[$d] = [];
+            if (!isset($grouped[$d][$ref])) $grouped[$d][$ref] = [];
+            $grouped[$d][$ref][] = $row;
+        }
+    ?>
+    <?php foreach ($grouped as $date => $refs): ?>
+    <div style="background:var(--background);padding:.6rem 1.25rem;font-size:.78rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:.5rem;">
+        <i data-lucide="calendar" size="13"></i>
+        <?php echo date('l, F j, Y', strtotime($date)); ?>
+        <span style="font-weight:500;color:var(--muted);opacity:.7;">(<?php echo array_sum(array_map('count', $refs)); ?> entries)</span>
+    </div>
+    <?php foreach ($refs as $ref => $rows):
+        $toggleId = 'ref-' . md5($date . $ref);
+        $grouped_items = [];
+        foreach ($rows as $row) {
+            $key = ($row['product_name'] ?? 'Unknown') . '||' . ($row['unit'] ?? '');
+            if (!isset($grouped_items[$key])) {
+                $grouped_items[$key] = $row;
+                $grouped_items[$key]['quantity_used'] = 0;
+            }
+            $grouped_items[$key]['quantity_used'] += $row['quantity_used'];
+        }
+    ?>
+    <div onclick="toggleRef('<?= $toggleId ?>')" style="padding:.5rem 1.25rem;background:#fdfaf7;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:.5rem;cursor:pointer;user-select:none;">
+        <i data-lucide="chevron-down" size="14" id="ico-<?= $toggleId ?>" style="color:var(--muted);transition:transform .2s;"></i>
+        <span style="font-size:.72rem;font-weight:700;color:var(--primary);background:#f5ede6;padding:.15rem .55rem;border-radius:6px;"><?php echo htmlspecialchars($ref); ?></span>
+        <span style="font-size:.72rem;color:var(--muted);">submitted <?php echo $rows[0]['submitted_at'] ? date('g:i A', strtotime($rows[0]['submitted_at'])) : '—'; ?></span>
+        <span style="font-size:.72rem;color:var(--muted);margin-left:auto;"><?= count($grouped_items) ?> item<?= count($grouped_items) !== 1 ? 's' : '' ?></span>
+    </div>
+    <div id="<?= $toggleId ?>">
+    <table>
+        <thead><tr><th>Branch</th><th>Item</th><th>Category</th><th>Qty Used</th><th>Unit</th></tr></thead>
+        <tbody>
+        <?php foreach ($grouped_items as $item): ?>
+            <tr>
+                <td>
+                    <div style="font-weight:600;"><?= htmlspecialchars($item['branch_name'] ?? 'Unknown') ?></div>
+                    <div style="font-size:0.78rem;color:var(--muted);"><?= htmlspecialchars($item['franchisee_name'] ?? '') ?></div>
+                </td>
+                <td>
+                    <div style="font-weight:500;"><?= htmlspecialchars($item['product_name'] ?? 'Unknown') ?></div>
+                    <?php if (!empty($item['product_code'])): ?>
+                    <div style="font-size:0.72rem;color:var(--muted);font-family:monospace;"><?= htmlspecialchars($item['product_code']) ?></div>
+                    <?php endif; ?>
+                </td>
+                <td><span class="category-tag"><?= htmlspecialchars($item['category'] ?? '—') ?></span></td>
+                <td style="font-weight:700;"><?= number_format($item['quantity_used']) ?></td>
+                <td style="color:var(--muted);"><?= htmlspecialchars($item['unit']) ?></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+    </div>
+    <?php endforeach; endforeach; ?>
+    <?php else: ?>
+        <p class="empty-state">No usage records found for the selected filters.</p>
+    <?php endif; ?>
+</div>
+<?php
+$usage_html = ob_get_clean();
+header('Content-Type: application/json');
+echo json_encode(['defaults' => $defaults_html, 'usage' => $usage_html]);
+exit;
+endif; ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -160,13 +322,6 @@ $top_branches_res = $conn->query("
         .header h2 { font-family: 'Fraunces', serif; font-size: 2rem; margin-bottom: 0.25rem; }
         .header p { color: var(--muted); font-size: 1rem; }
         .view-only-badge { background: #f3f4f6; color: #6b7280; padding: 0.35rem 0.75rem; border-radius: 8px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
-
-        /* Stats */
-        .stats-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 1.5rem; margin-bottom: 2rem; }
-        .stat-card { background: white; border: 1px solid var(--card-border); padding: 1.5rem; border-radius: 20px; }
-        .stat-card .stat-label { font-size: 0.75rem; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.5rem; display: block; }
-        .stat-card .value { font-size: 1.75rem; font-weight: 700; font-family: 'Fraunces', serif; }
-        .stat-card .sub { font-size: 0.78rem; color: var(--muted); margin-top: 0.3rem; }
 
         /* Filter bar */
         .filter-bar { display: flex; gap: 1rem; margin-bottom: 1.5rem; align-items: center; flex-wrap: wrap; }
@@ -244,130 +399,151 @@ $top_branches_res = $conn->query("
         <div class="header">
             <div>
                 <h2>Item Usage Monitoring</h2>
-                <p>Real-time visibility of branch-level consumption &mdash; View Only</p>
+                <p>Monitor and review franchisee pre-recorded item usage across all branches</p>
             </div>
             <div class="view-only-badge">Read Only Access</div>
         </div>
 
-        <!-- STATS -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <span class="stat-label">Total Submissions</span>
-                <div class="value"><?= number_format($total_submissions) ?></div>
-                <p class="sub">In selected period</p>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Total Qty Used</span>
-                <div class="value"><?= number_format($total_qty_used) ?></div>
-                <p class="sub">Units across all items</p>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Active Branches</span>
-                <div class="value"><?= number_format($active_branches) ?></div>
-                <p class="sub">With submissions</p>
-            </div>
-            <div class="stat-card">
-                <span class="stat-label">Unique Items Used</span>
-                <div class="value"><?= number_format($unique_items) ?></div>
-                <p class="sub">Distinct products</p>
-            </div>
-        </div>
-
         <!-- FILTERS -->
-        <form method="GET" action="admin-usage.php">
-            <div class="filter-bar">
-                <div class="search-box">
-                    <i data-lucide="search"></i>
-                    <input type="text" name="search" placeholder="Search by item, category, or branch..."
-                        value="<?= htmlspecialchars($filter_search) ?>">
-                </div>
-                <select class="filter-select" name="franchisee">
-                    <option value="0">All Branches</option>
-                    <?php foreach ($franchisees as $f): ?>
-                        <option value="<?= $f['id'] ?>" <?= $filter_franchisee == $f['id'] ? 'selected' : '' ?>>
-                            <?= htmlspecialchars($f['branch_name']) ?><?= $f['franchisee_name'] ? ' — ' . htmlspecialchars($f['franchisee_name']) : '' ?>
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-                <select class="filter-select" name="range">
-                    <option value="7"  <?= $filter_range === '7'   ? 'selected' : '' ?>>Last 7 Days</option>
-                    <option value="30" <?= $filter_range === '30'  ? 'selected' : '' ?>>Last 30 Days</option>
-                    <option value="90" <?= $filter_range === '90'  ? 'selected' : '' ?>>Last 90 Days</option>
-                    <option value="all"<?= $filter_range === 'all' ? 'selected' : '' ?>>All Time</option>
-                </select>
-                <button type="submit" class="btn-filter"><i data-lucide="filter"></i> Apply</button>
+        <div class="filter-bar">
+            <div class="search-box">
+                <i data-lucide="search"></i>
+                <input type="text" id="filter-search" placeholder="Search by item, category, or branch..."
+                    value="<?= htmlspecialchars($filter_search) ?>">
             </div>
-        </form>
-
-        <!-- TOP ITEMS & TOP BRANCHES -->
-        <div class="content-grid">
-            <div class="card">
-                <div class="card-header">
-                    <h3>Top Items by Usage</h3>
-                    <span>By total quantity</span>
-                </div>
-                <div class="rank-list">
-                <?php if ($top_items_res && $top_items_res->num_rows > 0):
-                    $rank = 1;
-                    while ($item = $top_items_res->fetch_assoc()): ?>
-                    <div class="rank-item">
-                        <div class="rank-num <?= $rank === 1 ? 'top' : '' ?>"><?= $rank ?></div>
-                        <div class="rank-info">
-                            <h4><?= htmlspecialchars($item['product_name'] ?? 'Unknown') ?></h4>
-                            <p><?= htmlspecialchars($item['category'] ?? '') ?> &middot; <?= $item['submission_count'] ?> submissions</p>
-                        </div>
-                        <div class="rank-qty">
-                            <?= number_format($item['total_qty']) ?>
-                            <span><?= htmlspecialchars($item['unit']) ?></span>
-                        </div>
-                    </div>
-                    <?php $rank++; endwhile;
-                else: ?>
-                    <p class="empty-state">No data for this period.</p>
-                <?php endif; ?>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h3>Most Active Branches</h3>
-                    <span>By submissions</span>
-                </div>
-                <div class="rank-list">
-                <?php if ($top_branches_res && $top_branches_res->num_rows > 0):
-                    $rank = 1;
-                    while ($branch = $top_branches_res->fetch_assoc()): ?>
-                    <div class="rank-item">
-                        <div class="rank-num <?= $rank === 1 ? 'top' : '' ?>"><?= $rank ?></div>
-                        <div class="rank-info">
-                            <h4><?= htmlspecialchars($branch['franchisee_name'] ?? 'Unknown') ?></h4>
-                            <p><?= htmlspecialchars($branch['branch_name'] ?? '') ?></p>
-                        </div>
-                        <div class="rank-qty">
-                            <?= number_format($branch['submissions']) ?>
-                            <span>submissions</span>
-                        </div>
-                    </div>
-                    <?php $rank++; endwhile;
-                else: ?>
-                    <p class="empty-state">No data for this period.</p>
-                <?php endif; ?>
-                </div>
-            </div>
+            <select class="filter-select" id="filter-franchisee">
+                <option value="0">All Branches</option>
+                <?php foreach ($franchisees as $f): ?>
+                    <option value="<?= $f['id'] ?>" <?= $filter_franchisee == $f['id'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($f['branch_name']) ?><?= $f['franchisee_name'] ? ' — ' . htmlspecialchars($f['franchisee_name']) : '' ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+            <button type="button" class="btn-filter" onclick="applyFilters()"><i data-lucide="filter"></i> Apply</button>
         </div>
 
-        <!-- MAIN USAGE TABLE -->
+        <!-- DEFAULT ITEMS — swappable -->
+        <div id="panel-defaults" style="transition:opacity .2s;margin-bottom:1.5rem;">
         <div class="card">
             <div class="card-header">
-                <h3>All Usage Records</h3>
-                <span>
+                <h3><i data-lucide="bookmark" size="18" style="vertical-align:middle;margin-right:.4rem;color:var(--primary);"></i>
+                    <?php echo $filter_franchisee > 0 ? 'Default Items' : 'Franchisee Default Items'; ?>
+                </h3>
+                <span><?php echo $filter_franchisee > 0 ? 'Locked defaults' : 'Select a branch'; ?></span>
+            </div>
+
+            <?php if ($filter_franchisee === 0): ?>
+                <p class="empty-state">
+                    <i data-lucide="git-branch" size="32" style="display:block;margin:0 auto .75rem;opacity:.3;"></i>
+                    Select a Franchisee<br>
+                    <span style="font-size:.82rem;font-weight:400;">Choose a specific branch above to view its default items.</span>
+                </p>
+            <?php elseif (empty($defaults_by_branch)): ?>
+                <p class="empty-state">
+                    <i data-lucide="inbox" size="32" style="display:block;margin:0 auto .75rem;opacity:.3;"></i>
+                    No Default Items Yet<br>
+                    <span style="font-size:.82rem;font-weight:400;">
+                    <?php echo $filtered_branch_info
+                        ? htmlspecialchars($filtered_branch_info['branch_name']) . " hasn't locked any default items yet."
+                        : "This branch hasn't set any default items yet."; ?>
+                    </span>
+                </p>
+            <?php else: ?>
+                <?php foreach ($defaults_by_branch as $fid => $ddata):
+                    if (count($defaults_by_branch) > 1): ?>
+                    <div style="padding:.5rem 1.5rem;background:var(--background);border-bottom:1px solid var(--card-border);font-size:.75rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;">
+                        <?php echo htmlspecialchars($ddata['branch_name']); ?>
+                        <span style="font-weight:400;text-transform:none;"> — <?php echo htmlspecialchars($ddata['franchisee_name']); ?></span>
+                    </div>
+                    <?php endif; ?>
+                    <div class="rank-list">
+                    <?php $rank = 1; foreach ($ddata['items'] as $di): ?>
+                    <div class="rank-item">
+                        <div class="rank-num <?php echo $rank === 1 ? 'top' : ''; ?>"><?php echo $rank; ?></div>
+                        <div class="rank-info">
+                            <h4><?php echo htmlspecialchars($di['product_name']); ?></h4>
+                            <p><?php echo htmlspecialchars($di['category']); ?></p>
+                        </div>
+                        <div class="rank-qty">
+                            <?php echo $di['quantity']; ?>
+                            <span><?php echo htmlspecialchars($di['unit']); ?></span>
+                        </div>
+                    </div>
+                    <?php $rank++; endforeach; ?>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+        </div><!-- end panel-defaults -->
+
+        <!-- USAGE HISTORY (full width, swappable) -->
+        <div id="panel-usage" style="transition:opacity .2s;">
+        <div class="card">
+            <div class="card-header">
+                <h3>
+                    <?php if ($filter_franchisee > 0):
+                        $fn_res = $conn->query("SELECT COALESCE(f.franchisee_name, u.full_name, 'Unknown') AS name, f.branch_name FROM franchisees f LEFT JOIN users u ON u.user_id = f.user_id WHERE f.id = $filter_franchisee LIMIT 1");
+                        $fn = $fn_res ? $fn_res->fetch_assoc() : null;
+                    ?>
+                        Usage Records — <span style="color:var(--primary);"><?= htmlspecialchars($fn['name'] ?? 'Franchisee') ?></span>
+                    <?php else: ?>
+                        All Usage Records
+                    <?php endif; ?>
+                </h3>
+                <span style="display:flex;align-items:center;gap:.75rem;">
+                    <?php if ($filter_franchisee > 0): ?>
+                    <a href="#" onclick="clearFilter(event)" style="font-size:.8rem;color:var(--muted);text-decoration:none;display:flex;align-items:center;gap:.3rem;border:1px solid var(--card-border);padding:.25rem .75rem;border-radius:8px;">
+                        <i data-lucide="x" size="13"></i> Clear filter
+                    </a>
+                    <?php endif; ?>
                     <?php
                     $row_count = $usage_res ? $usage_res->num_rows : 0;
                     echo $row_count . ' ' . ($row_count === 1 ? 'record' : 'records');
                     ?>
                 </span>
             </div>
-            <?php if ($row_count > 0): ?>
+
+            <?php if ($row_count > 0):
+                // Group rows by date → by usage_ref
+                $grouped = [];
+                while ($row = $usage_res->fetch_assoc()) {
+                    $d   = $row['recording_date'];
+                    $ref = $row['usage_ref'] ?? '—';
+                    if (!isset($grouped[$d])) $grouped[$d] = [];
+                    if (!isset($grouped[$d][$ref])) $grouped[$d][$ref] = [];
+                    $grouped[$d][$ref][] = $row;
+                }
+            ?>
+            <?php foreach ($grouped as $date => $refs): ?>
+            <!-- Date header -->
+            <div style="background:var(--background);padding:.6rem 1.25rem;font-size:.78rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:.5rem;">
+                <i data-lucide="calendar" size="13"></i>
+                <?php echo date('l, F j, Y', strtotime($date)); ?>
+                <span style="font-weight:500;color:var(--muted);opacity:.7;">(<?php echo array_sum(array_map('count', $refs)); ?> entries)</span>
+            </div>
+
+            <?php foreach ($refs as $ref => $rows):
+                $toggleId = 'ref-' . md5($date . $ref);
+
+                // Group same product+unit combos together
+                $grouped_items = [];
+                foreach ($rows as $row) {
+                    $key = ($row['product_name'] ?? 'Unknown') . '||' . ($row['unit'] ?? '');
+                    if (!isset($grouped_items[$key])) {
+                        $grouped_items[$key] = $row;
+                        $grouped_items[$key]['quantity_used'] = 0;
+                    }
+                    $grouped_items[$key]['quantity_used'] += $row['quantity_used'];
+                }
+            ?>
+            <!-- Usage ref sub-header — clickable toggle -->
+            <div onclick="toggleRef('<?= $toggleId ?>')"
+                 style="padding:.5rem 1.25rem;background:#fdfaf7;border-bottom:1px solid var(--card-border);display:flex;align-items:center;gap:.5rem;cursor:pointer;user-select:none;">
+                <i data-lucide="chevron-down" size="14" id="ico-<?= $toggleId ?>" style="color:var(--muted);transition:transform .2s;"></i>
+                <span style="font-size:.72rem;font-weight:700;color:var(--primary);background:#f5ede6;padding:.15rem .55rem;border-radius:6px;"><?php echo htmlspecialchars($ref); ?></span>
+                <span style="font-size:.72rem;color:var(--muted);">submitted <?php echo $rows[0]['submitted_at'] ? date('g:i A', strtotime($rows[0]['submitted_at'])) : '—'; ?></span>
+                <span style="font-size:.72rem;color:var(--muted);margin-left:auto;"><?= count($grouped_items) ?> item<?= count($grouped_items) !== 1 ? 's' : '' ?></span>
+            </div>
+            <div id="<?= $toggleId ?>">
             <table>
                 <thead>
                     <tr>
@@ -376,49 +552,96 @@ $top_branches_res = $conn->query("
                         <th>Category</th>
                         <th>Qty Used</th>
                         <th>Unit</th>
-                        <th>Date Recorded</th>
-                        <th>Submitted At</th>
-                        <th>Linked Order</th>
                     </tr>
                 </thead>
                 <tbody>
-                <?php while ($row = $usage_res->fetch_assoc()): ?>
+                <?php foreach ($grouped_items as $item): ?>
                     <tr>
                         <td>
-                            <div style="font-weight:600;"><?= htmlspecialchars($row['branch_name'] ?? 'Unknown') ?></div>
-                            <div style="font-size:0.78rem;color:var(--muted);"><?= htmlspecialchars($row['franchisee_name'] ?? '') ?></div>
+                            <div style="font-weight:600;"><?= htmlspecialchars($item['branch_name'] ?? 'Unknown') ?></div>
+                            <div style="font-size:0.78rem;color:var(--muted);"><?= htmlspecialchars($item['franchisee_name'] ?? '') ?></div>
                         </td>
-                        <td style="font-weight:500;"><?= htmlspecialchars($row['product_name'] ?? 'Unknown') ?></td>
                         <td>
-                            <span class="category-tag"><?= htmlspecialchars($row['category'] ?? '—') ?></span>
-                        </td>
-                        <td style="font-weight:700;"><?= number_format($row['quantity_used']) ?></td>
-                        <td style="color:var(--muted);"><?= htmlspecialchars($row['unit']) ?></td>
-                        <td><?= date('M j, Y', strtotime($row['recording_date'])) ?></td>
-                        <td style="color:var(--muted);font-size:.85rem;">
-                            <?= $row['submitted_at'] ? date('M j, Y g:i A', strtotime($row['submitted_at'])) : '—' ?>
-                        </td>
-                        <td style="font-size:.85rem;">
-                            <?php if (!empty($row['po_number'])): ?>
-                                <span style="background:#eff6ff;color:#1d4ed8;font-weight:600;padding:.2rem .6rem;border-radius:6px;font-size:.78rem;">
-                                    <?= htmlspecialchars($row['po_number']) ?>
-                                </span>
-                            <?php else: ?>
-                                <span style="color:var(--muted);">—</span>
+                            <div style="font-weight:500;"><?= htmlspecialchars($item['product_name'] ?? 'Unknown') ?></div>
+                            <?php if (!empty($item['product_code'])): ?>
+                            <div style="font-size:0.72rem;color:var(--muted);font-family:monospace;"><?= htmlspecialchars($item['product_code']) ?></div>
                             <?php endif; ?>
                         </td>
+                        <td><span class="category-tag"><?= htmlspecialchars($item['category'] ?? '—') ?></span></td>
+                        <td style="font-weight:700;"><?= number_format($item['quantity_used']) ?></td>
+                        <td style="color:var(--muted);"><?= htmlspecialchars($item['unit']) ?></td>
                     </tr>
-                <?php endwhile; ?>
+                <?php endforeach; ?>
                 </tbody>
             </table>
+            </div>
+            <?php endforeach; ?>
+            <?php endforeach; ?>
+
             <?php else: ?>
                 <p class="empty-state">No usage records found for the selected filters.</p>
             <?php endif; ?>
         </div>
+
+        </div><!-- end panel-usage -->
     </main>
 
     <script>
         lucide.createIcons();
+
+        function toggleRef(id) {
+            const el = document.getElementById(id);
+            const ico = document.getElementById('ico-' + id);
+            const hidden = el.style.display === 'none';
+            el.style.display = hidden ? '' : 'none';
+            ico.style.transform = hidden ? '' : 'rotate(-90deg)';
+        }
+
+        function applyFilters() {
+            const franchisee = document.getElementById('filter-franchisee').value;
+            const search = document.getElementById('filter-search').value;
+            loadPanels(franchisee, search);
+        }
+
+        function clearFilter(e) {
+            e.preventDefault();
+            document.getElementById('filter-franchisee').value = '0';
+            document.getElementById('filter-search').value = '';
+            loadPanels('0', '');
+        }
+
+        function loadPanels(franchisee, search) {
+            const params = new URLSearchParams({ franchisee, search, ajax: '1' });
+            document.getElementById('panel-defaults').style.opacity = '0.4';
+            document.getElementById('panel-defaults').style.pointerEvents = 'none';
+            document.getElementById('panel-usage').style.opacity = '0.4';
+            document.getElementById('panel-usage').style.pointerEvents = 'none';
+
+            fetch('admin-usage.php?' + params.toString())
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('panel-defaults').innerHTML = data.defaults;
+                    document.getElementById('panel-usage').innerHTML    = data.usage;
+                    document.getElementById('panel-defaults').style.opacity = '';
+                    document.getElementById('panel-defaults').style.pointerEvents = '';
+                    document.getElementById('panel-usage').style.opacity = '';
+                    document.getElementById('panel-usage').style.pointerEvents = '';
+                    lucide.createIcons();
+
+                    const url = new URL(window.location);
+                    url.searchParams.set('franchisee', franchisee);
+                    url.searchParams.set('search', search);
+                    window.history.replaceState({}, '', url);
+                })
+                .catch(() => {
+                    document.getElementById('panel-defaults').style.opacity = '';
+                    document.getElementById('panel-defaults').style.pointerEvents = '';
+                    document.getElementById('panel-usage').style.opacity = '';
+                    document.getElementById('panel-usage').style.pointerEvents = '';
+                });
+        }
+
+
     </script>
 </body>
 </html>

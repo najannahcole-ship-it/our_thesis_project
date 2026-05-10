@@ -105,25 +105,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action']) && $_P
     $chk->close();
 
     if (!$order) { echo json_encode(['success' => false, 'message' => 'Order not found.']); exit(); }
-    if ($order['status'] !== 'Approved') { echo json_encode(['success' => false, 'message' => 'Order is no longer in Approved status.']); exit(); }
+    if (!in_array($order['status'], ['Approved', 'processing'])) { echo json_encode(['success' => false, 'message' => 'Order status is: ' . $order['status'] . '. Not available for fulfillment.']); exit(); }
 
     $isDelivery   = stripos($order['delivery_preference'], 'pickup') === false;
-    $finalRiderId = $riderId ?: intval($order['assigned_rider_id']);
 
-    if ($isDelivery && !$finalRiderId) {
-        echo json_encode(['success' => false, 'message' => 'A delivery rider must be assigned for delivery orders.']); exit();
-    }
-
+    // Note: rider assignment handled separately - FK on assigned_rider_id refs riders table not users
     $riderName = null;
-    if ($finalRiderId) {
-        $rChk = $conn->prepare("SELECT user_id, full_name FROM users WHERE user_id = ? AND role_id = 5 AND status = 'Active'");
-        $rChk->bind_param('i', $finalRiderId);
-        $rChk->execute();
-        $riderRow = $rChk->get_result()->fetch_assoc();
-        $rChk->close();
-        if (!$riderRow) { echo json_encode(['success' => false, 'message' => 'Invalid rider selected.']); exit(); }
-        $riderName = $riderRow['full_name'];
-    }
 
     $iStmt = $conn->prepare("
         SELECT oi.product_id, oi.quantity, p.name, p.stock_qty
@@ -145,65 +132,101 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action']) && $_P
     $conn->begin_transaction();
     try {
         $deduct = $conn->prepare("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?");
+        if (!$deduct) throw new Exception("Deduct prepare failed: " . $conn->error);
         foreach ($items as $item) {
             $deduct->bind_param('ii', $item['quantity'], $item['product_id']);
-            $deduct->execute();
+            if (!$deduct->execute()) throw new Exception("Deduct execute failed: " . $deduct->error);
         }
         $deduct->close();
 
-        // Always mark as completed after fulfillment — clerk's job is done.
-        // 'Ready' is not in the orders status enum so we use 'completed' for all cases.
-        $newStatus   = 'completed';
-        $newStep     = 4;
-        $statusLabel = 'Completed';
-
-        $updOrder = $conn->prepare("UPDATE orders SET status = ?, status_step = ?, assigned_rider_id = COALESCE(NULLIF(?,0), assigned_rider_id) WHERE id = ?");
-        $updOrder->bind_param('siii', $newStatus, $newStep, $finalRiderId, $orderId);
-        $updOrder->execute();
+        if ($isDelivery) {
+            // Delivery orders → out_for_delivery so rider can pick it up
+            $newStatus      = 'out_for_delivery';
+            $newStep        = 3;
+            $newDelivStatus = 'assigned';
+            $statusLabel    = 'Out for Delivery';
+            $detail         = 'Order fulfilled by Inventory Clerk ' . $clerkName . '. Stock deducted. Ready for rider pickup.';
+            $updOrder = $conn->prepare("UPDATE orders SET status = ?, status_step = ?, delivery_status = ? WHERE id = ?");
+            if (!$updOrder) throw new Exception("Update prepare failed: " . $conn->error);
+            $updOrder->bind_param('sisi', $newStatus, $newStep, $newDelivStatus, $orderId);
+        } else {
+            // Pickup orders → completed immediately
+            $newStatus   = 'completed';
+            $newStep     = 4;
+            $statusLabel = 'Completed';
+            $detail      = 'Order fulfilled by Inventory Clerk ' . $clerkName . '. Stock deducted. Ready for franchisee pickup.';
+            $updOrder = $conn->prepare("UPDATE orders SET status = ?, status_step = ? WHERE id = ?");
+            if (!$updOrder) throw new Exception("Update prepare failed: " . $conn->error);
+            $updOrder->bind_param('sii', $newStatus, $newStep, $orderId);
+        }
+        if (!$updOrder->execute()) throw new Exception("Update execute failed: " . $updOrder->error);
         $updOrder->close();
 
-        $detail = 'Order fulfilled by Inventory Clerk ' . $clerkName . '. Stock deducted from warehouse.';
-        if ($riderName) $detail .= ' Rider assigned: ' . $riderName . '.';
-
-        $hist = $conn->prepare("INSERT INTO order_status_history (order_id, status_step, status_label, detail, changed_by) VALUES (?, ?, ?, ?, ?)");
+        $hist = $conn->prepare("INSERT INTO order_status_history (order_id, status_step, status_label, detail, changed_at, changed_by) VALUES (?, ?, ?, ?, NOW(), ?)");
+        if (!$hist) throw new Exception("History prepare failed: " . $conn->error);
         $hist->bind_param('iissi', $orderId, $newStep, $statusLabel, $detail, $clerkId);
-        $hist->execute();
+        if (!$hist->execute()) throw new Exception("History execute failed: " . $hist->error);
         $hist->close();
 
         $conn->commit();
-        echo json_encode(['success' => true, 'message' => 'Order ' . $order['po_number'] . ' fulfilled and marked as Completed. Stock deducted successfully.']);
+        $msg = $isDelivery
+            ? 'Order ' . $order['po_number'] . ' is now Out for Delivery. Rider will be notified.'
+            : 'Order ' . $order['po_number'] . ' fulfilled and marked as Completed. Ready for pickup.';
+        echo json_encode(['success' => true, 'message' => $msg]);
     } catch (Exception $e) {
         $conn->rollback();
-        echo json_encode(['success' => false, 'message' => 'Transaction failed. Please try again.']);
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
     }
     $conn->close(); exit();
 }
 
 // ── Load orders by status ─────────────────────────────────────
 function fetchOrders($conn, $status) {
-    $stmt = $conn->prepare("
-        SELECT o.id, o.po_number, o.status, o.delivery_preference,
-               o.total_amount, o.created_at, o.payment_status,
-               COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
-               f.branch_name,
-               enc.full_name AS encoder_name,
-               adm.full_name AS approver_name
-        FROM orders o
-        JOIN franchisees f   ON f.id        = o.franchisee_id
-        LEFT JOIN users  uf  ON uf.user_id  = f.user_id
-        LEFT JOIN users  enc ON enc.user_id = o.assigned_encoder_id
-        LEFT JOIN users  adm ON adm.user_id = o.approved_by
-        WHERE o.status = ?
-        ORDER BY o.created_at ASC
-    ");
-    $stmt->bind_param('s', $status);
+    if (is_array($status)) {
+        $placeholders = implode(',', array_fill(0, count($status), '?'));
+        $types = str_repeat('s', count($status));
+        $stmt = $conn->prepare("
+            SELECT o.id, o.po_number, o.status, o.delivery_preference,
+                   o.total_amount, o.created_at, o.payment_status,
+                   COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
+                   f.branch_name,
+                   enc.full_name AS encoder_name,
+                   adm.full_name AS approver_name
+            FROM orders o
+            JOIN franchisees f   ON f.id        = o.franchisee_id
+            LEFT JOIN users  uf  ON uf.user_id  = f.user_id
+            LEFT JOIN users  enc ON enc.user_id = o.assigned_encoder_id
+            LEFT JOIN users  adm ON adm.user_id = o.approved_by
+            WHERE o.status IN ($placeholders)
+            ORDER BY o.created_at ASC
+        ");
+        $stmt->bind_param($types, ...$status);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT o.id, o.po_number, o.status, o.delivery_preference,
+                   o.total_amount, o.created_at, o.payment_status,
+                   COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
+                   f.branch_name,
+                   enc.full_name AS encoder_name,
+                   adm.full_name AS approver_name
+            FROM orders o
+            JOIN franchisees f   ON f.id        = o.franchisee_id
+            LEFT JOIN users  uf  ON uf.user_id  = f.user_id
+            LEFT JOIN users  enc ON enc.user_id = o.assigned_encoder_id
+            LEFT JOIN users  adm ON adm.user_id = o.approved_by
+            WHERE o.status = ?
+            ORDER BY o.created_at ASC
+        ");
+        $stmt->bind_param('s', $status);
+    }
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
     return $rows;
 }
 
-$approvedOrders  = fetchOrders($conn, 'Approved');
+$approvedOrders  = fetchOrders($conn, ['Approved', 'processing']);
+$deliveryOrders  = fetchOrders($conn, 'out_for_delivery');
 $completedOrders = fetchOrders($conn, 'completed');
 $pendingCount    = count($approvedOrders);
 $conn->close();
@@ -430,8 +453,46 @@ $conn->close();
         <div class="tab active" data-target="approved" onclick="switchTab('approved')">
             For Fulfillment <span class="tab-count"><?php echo count($approvedOrders); ?></span>
         </div>
+        <div class="tab" data-target="delivery" onclick="switchTab('delivery')">
+            Out for Delivery <span class="tab-count"><?php echo count($deliveryOrders); ?></span>
+        </div>
         <div class="tab" data-target="completed" onclick="switchTab('completed')">
             Completed <span class="tab-count"><?php echo count($completedOrders); ?></span>
+        </div>
+    </div>
+
+    <!-- Out for Delivery Tab -->
+    <div class="tab-panel" id="panel-delivery">
+        <div class="card">
+            <table>
+                <thead><tr>
+                    <th>PO Number</th><th>Branch</th><th>Delivery</th>
+                    <th>Amount</th><th>Payment</th><th style="text-align:right">Actions</th>
+                </tr></thead>
+                <tbody>
+                <?php if (empty($deliveryOrders)): ?>
+                    <tr><td colspan="6" style="text-align:center;padding:2rem;color:var(--muted);">No orders currently out for delivery.</td></tr>
+                <?php else: foreach ($deliveryOrders as $o): ?>
+                    <tr>
+                        <td><strong><?php echo htmlspecialchars($o['po_number']); ?></strong></td>
+                        <td>
+                            <div style="font-weight:600;"><?php echo htmlspecialchars($o['branch_name'] ?? '—'); ?></div>
+                            <div style="font-size:.78rem;color:var(--muted);"><?php echo htmlspecialchars($o['franchisee_name'] ?? '—'); ?></div>
+                        </td>
+                        <td><?php echo htmlspecialchars($o['delivery_preference']); ?></td>
+                        <td>₱<?php echo number_format($o['total_amount'], 2); ?></td>
+                        <td>
+                            <span class="pill <?php echo strtolower($o['payment_status'] ?? '') === 'paid' ? 'pill-paid' : 'pill-unpaid'; ?>">
+                                <?php echo strtolower($o['payment_status'] ?? '') === 'paid' ? 'Paid' : 'Unpaid'; ?>
+                            </span>
+                        </td>
+                        <td style="text-align:right;">
+                            <button class="btn-view" onclick="openModal(<?php echo $o['id']; ?>)">View Details</button>
+                        </td>
+                    </tr>
+                <?php endforeach; endif; ?>
+                </tbody>
+            </table>
         </div>
     </div>
 
@@ -626,7 +687,7 @@ $conn->close();
                 currentOrderData = data.order;
                 renderModal(data.order, data.items, data.history);
                 const isDelivery = !data.order.delivery_preference.toLowerCase().includes('pickup');
-                if (data.order.status === 'Approved' && isDelivery) fetchRiders();
+                if ((data.order.status === 'Approved' || data.order.status === 'processing') && isDelivery) fetchRiders();
             })
             .catch(() => { showToast('Failed to load order details.', 'error'); closeModal(); });
     }
@@ -683,7 +744,7 @@ $conn->close();
             : '<p style="font-size:.85rem;color:var(--muted);">No history recorded yet.</p>';
 
         const isDelivery = !order.delivery_preference.toLowerCase().includes('pickup');
-        const isApproved = order.status === 'Approved';
+        const isApproved = order.status === 'Approved' || order.status === 'processing';
         document.getElementById('riderPanel').style.display = (isApproved && isDelivery) ? 'block' : 'none';
 
         const actionsDiv = document.getElementById('modal-actions');
@@ -748,16 +809,6 @@ $conn->close();
 
     function triggerFulfill(poNumber) {
         if (!currentOrderId) return;
-        const isDelivery = !currentOrderData?.delivery_preference?.toLowerCase().includes('pickup');
-        if (isDelivery && !selectedRiderId) {
-            const panel = document.getElementById('riderPanel');
-            panel.style.border = '2px solid #dc2626';
-            setTimeout(() => panel.style.border = '1px solid #bbf7d0', 2000);
-            showToast('Please assign a delivery rider before fulfilling.', 'error');
-            return;
-        }
-
-        // Update confirm dialog body
         document.getElementById('confirm-body-text').innerHTML =
             'Stock will be permanently deducted from the warehouse and the order will be marked as <strong>Completed</strong>.';
         document.getElementById('confirm-po').textContent = poNumber;
@@ -776,7 +827,6 @@ $conn->close();
         if (btn) btn.disabled = true;
 
         const body = new URLSearchParams({ ajax_action: 'fulfill', order_id: currentOrderId });
-        if (selectedRiderId) body.append('rider_id', selectedRiderId);
 
         fetch('clerk-orders.php', { method: 'POST', body })
             .then(r => r.json())

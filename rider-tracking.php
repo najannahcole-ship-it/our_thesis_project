@@ -1,14 +1,8 @@
 <?php
 // ============================================================
-// rider-tracking.php — Delivery Status Update
-// DB Tables used:
-//   READ  → orders + franchisees + order_items + products
-//   WRITE → orders              (UPDATE status + status_step)
-//   WRITE → order_status_history (INSERT log entry per step)
-// Status steps the rider controls:
-//   3 → 3  = "Picked Up"  (still step 3, adds history log)
-//   3 → 3  = "In Transit" (still step 3, adds history log)
-//   3 → 4  = "Delivered"  (moves to Completed)
+// rider-tracking.php — Delivery Tracking
+// Shows the rider's accepted orders as a list. Clicking one
+// opens the status-update view for that specific order.
 // ============================================================
 session_start();
 if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 5) { header('Location: index.php'); exit(); }
@@ -18,22 +12,26 @@ header("Pragma: no-cache");
 
 require_once 'db.php';
 
+// Auto-add missing columns so the page never crashes on a fresh DB
+$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `delivery_status` VARCHAR(50)  NULL");
+$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `pod_photo`       VARCHAR(255) NULL");
+$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `rider_id`        BIGINT(20)   NULL");
+
 $riderId   = $_SESSION['user_id'];
 $riderName = $_SESSION['full_name'] ?? 'Delivery Rider';
 
 // ── Handle POST: update delivery status ───────────────────────
 $actionMsg = '';
+$errorMsg  = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $poNum  = trim($_POST['po']     ?? '');
     $action = trim($_POST['action'] ?? '');
-    $notes  = trim($_POST['notes']  ?? '');
 
     if ($poNum && in_array($action, ['pickedup','intransit','complete'])) {
 
-        // Get the order ID
-        $stmt = $conn->prepare("SELECT id, status_step FROM orders WHERE po_number = ?");
-        $stmt->bind_param("s", $poNum);
+        $stmt = $conn->prepare("SELECT id, status_step FROM orders WHERE po_number = ? AND rider_id = ?");
+        $stmt->bind_param("si", $poNum, $riderId);
         $stmt->execute();
         $ord = $stmt->get_result()->fetch_assoc();
         $stmt->close();
@@ -42,115 +40,178 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $orderId = $ord['id'];
 
             if ($action === 'pickedup') {
-                // Log "Picked Up" but keep step at 3
-                $label  = 'Picked Up';
-                $detail = 'Order collected from warehouse by delivery rider. ' . ($notes ?: '');
-                $conn->prepare("UPDATE orders SET status = 'Picked Up' WHERE id = ?")->execute() || null;
-                $upd = $conn->prepare("UPDATE orders SET status = ? WHERE id = ?");
-                $upd->bind_param("si", $label, $orderId); $upd->execute(); $upd->close();
+                $label         = 'Picked Up';
+                $deliveryLabel = 'picked_up';
+                $detail        = 'Order collected from warehouse by delivery rider.';
+                $upd = $conn->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
+                $upd->bind_param("si", $deliveryLabel, $orderId);
+                $upd->execute(); $upd->close();
 
             } elseif ($action === 'intransit') {
-                $label  = 'In Transit';
-                $detail = 'Order is en route to the franchisee branch. ' . ($notes ?: '');
-                $upd = $conn->prepare("UPDATE orders SET status = ? WHERE id = ?");
-                $upd->bind_param("si", $label, $orderId); $upd->execute(); $upd->close();
+                $label         = 'In Transit';
+                $deliveryLabel = 'in_transit';
+                $detail        = 'Order is en route to the franchisee branch.';
+                $upd = $conn->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
+                $upd->bind_param("si", $deliveryLabel, $orderId);
+                $upd->execute(); $upd->close();
 
             } elseif ($action === 'complete') {
-                // Mark as Completed (step 4)
-                $label   = 'Completed';
-                $detail  = 'Order successfully delivered to franchisee. ' . ($notes ?: '');
-                $newStep = 4;
-                $upd = $conn->prepare("UPDATE orders SET status = ?, status_step = ? WHERE id = ?");
-                $upd->bind_param("sii", $label, $newStep, $orderId); $upd->execute(); $upd->close();
+                if (empty($_FILES['pod_photo']['tmp_name'])) {
+                    $errorMsg = 'Please attach a proof-of-delivery photo before confirming.';
+                } else {
+                    $file     = $_FILES['pod_photo'];
+                    $allowed  = ['image/jpeg','image/png','image/webp','image/gif'];
+                    $maxBytes = 5 * 1024 * 1024;
+
+                    if (!in_array($file['type'], $allowed)) {
+                        $errorMsg = 'Invalid file type. Please upload a JPEG, PNG, or WebP image.';
+                    } elseif ($file['size'] > $maxBytes) {
+                        $errorMsg = 'Photo is too large. Maximum size is 5 MB.';
+                    } else {
+                        $uploadDir = __DIR__ . '/uploads/pod/';
+                        if (!is_dir($uploadDir)) { mkdir($uploadDir, 0755, true); }
+                        $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
+                        $filename = 'pod_' . $orderId . '_' . time() . '.' . $ext;
+                        $dest     = $uploadDir . $filename;
+
+                        if (!move_uploaded_file($file['tmp_name'], $dest)) {
+                            $errorMsg = 'Failed to save photo. Please try again.';
+                        } else {
+                            $podPath       = 'uploads/pod/' . $filename;
+                            $label         = 'Delivered';
+                            $deliveryLabel = 'delivered';
+                            $newStep       = 4;
+                            $newStatus     = 'completed';
+                            $detail        = 'Order successfully delivered to franchisee.';
+
+                            $upd = $conn->prepare("
+                                UPDATE orders
+                                SET `status` = ?, status_step = ?, delivery_status = ?, pod_photo = ?
+                                WHERE id = ?
+                            ");
+                            if (!$upd) {
+                                die("Prepare failed (orders UPDATE): " . htmlspecialchars($conn->error));
+                            }
+                            $upd->bind_param("sissi", $newStatus, $newStep, $deliveryLabel, $podPath, $orderId);
+                            $upd->execute(); $upd->close();
+
+                            $stepNum = 4;
+                            $ins = $conn->prepare("
+                                INSERT INTO order_status_history
+                                    (order_id, status_step, status_label, detail, changed_at, changed_by)
+                                VALUES (?, ?, ?, ?, NOW(), ?)
+                            ");
+                            if (!$ins) {
+                                die("Prepare failed (order_status_history INSERT): " . htmlspecialchars($conn->error));
+                            }
+                            $ins->bind_param("iissi", $orderId, $stepNum, $label, $detail, $riderId);
+                            $ins->execute(); $ins->close();
+
+                            $conn->close();
+                            header("Location: rider-tracking.php?done=1");
+                            exit();
+                        }
+                    }
+                }
             }
 
-            // Log to order_status_history
-            $stepNum = ($action === 'complete') ? 4 : 3;
-            $ins = $conn->prepare("
-                INSERT INTO order_status_history
-                    (order_id, status_step, status_label, detail, changed_at, changed_by)
-                VALUES (?, ?, ?, ?, NOW(), ?)
-            ");
-            $ins->bind_param("iissi", $orderId, $stepNum, $label, $detail, $riderId);
-            $ins->execute();
-            $ins->close();
-
-            $actionMsg = $label;
-
-            // Redirect after completing
-            if ($action === 'complete') {
-                $conn->close();
-                header("Location: rider-assignment.php?done=1");
-                exit();
+            // Log history for non-complete actions
+            if (!$errorMsg && $action !== 'complete') {
+                $stepNum = 3;
+                $ins = $conn->prepare("
+                    INSERT INTO order_status_history
+                        (order_id, status_step, status_label, detail, changed_at, changed_by)
+                    VALUES (?, ?, ?, ?, NOW(), ?)
+                ");
+                $ins->bind_param("iissi", $orderId, $stepNum, $label, $detail, $riderId);
+                $ins->execute(); $ins->close();
+                $actionMsg = $label;
             }
         }
     }
 }
 
-// ── Determine which order to track ────────────────────────────
-// From URL param ?po=  OR most recent Ready order
-$selectedPO = $_GET['po'] ?? $_POST['po'] ?? '';
+// ── Determine view mode: list or detail ───────────────────────
+$selectedPO = trim($_GET['po'] ?? $_POST['po'] ?? '');
 $order      = null;
 $orderItems = [];
 $history    = [];
 
+// ── Always load the rider's active orders for the list ─────────
+$myOrders = [];
+$res = $conn->query("
+    SELECT o.id, o.po_number, o.delivery_preference, o.total_amount,
+           o.estimated_pickup, o.delivery_status,
+           COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
+           f.branch_name
+    FROM orders o
+    LEFT JOIN franchisees f ON f.id = o.franchisee_id
+    LEFT JOIN users uf ON uf.user_id = f.user_id
+    WHERE o.rider_id = $riderId
+      AND o.status_step = 3
+      AND o.delivery_status != 'delivered'
+    ORDER BY o.estimated_pickup ASC, o.created_at ASC
+");
+if ($res) { while ($row = $res->fetch_assoc()) { $myOrders[] = $row; } }
+
+// ── Load detail if a PO is selected ───────────────────────────
 if ($selectedPO) {
     $stmt = $conn->prepare("
-        SELECT o.*, f.branch_name, f.franchisee_name
+        SELECT o.*, f.branch_name,
+               COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name
         FROM orders o
         LEFT JOIN franchisees f ON f.id = o.franchisee_id
-        WHERE o.po_number = ?
+        LEFT JOIN users uf ON uf.user_id = f.user_id
+        WHERE o.po_number = ? AND o.rider_id = ?
     ");
-    $stmt->bind_param("s", $selectedPO);
+    $stmt->bind_param("si", $selectedPO, $riderId);
     $stmt->execute();
     $order = $stmt->get_result()->fetch_assoc();
     $stmt->close();
-}
 
-if (!$order) {
-    // Show most recent order at step 3 or 4
-    $order = $conn->query("
-        SELECT o.*, f.branch_name, f.franchisee_name
-        FROM orders o
-        LEFT JOIN franchisees f ON f.id = o.franchisee_id
-        WHERE o.status_step IN (3,4)
-        ORDER BY o.created_at DESC LIMIT 1
-    ")->fetch_assoc();
-}
+    if ($order) {
+        $stmt = $conn->prepare("
+            SELECT oi.quantity, oi.unit_price, oi.subtotal, p.name, p.unit
+            FROM order_items oi JOIN products p ON p.id = oi.product_id
+            WHERE oi.order_id = ?
+        ");
+        $stmt->bind_param("i", $order['id']);
+        $stmt->execute();
+        $r = $stmt->get_result();
+        while ($row = $r->fetch_assoc()) { $orderItems[] = $row; }
+        $stmt->close();
 
-if ($order) {
-    // Fetch items
-    $stmt = $conn->prepare("
-        SELECT oi.quantity, oi.unit_price, oi.subtotal, p.name, p.unit
-        FROM order_items oi JOIN products p ON p.id = oi.product_id
-        WHERE oi.order_id = ?
-    ");
-    $stmt->bind_param("i", $order['id']);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    while ($row = $result->fetch_assoc()) { $orderItems[] = $row; }
-    $stmt->close();
-
-    // Fetch status history (newest first)
-    $stmt = $conn->prepare("
-        SELECT status_label, detail, changed_at
-        FROM order_status_history WHERE order_id = ?
-        ORDER BY changed_at DESC
-    ");
-    $stmt->bind_param("i", $order['id']);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    while ($row = $result->fetch_assoc()) { $history[] = $row; }
-    $stmt->close();
+        $stmt = $conn->prepare("
+            SELECT status_label, detail, changed_at
+            FROM order_status_history WHERE order_id = ?
+            ORDER BY changed_at DESC
+        ");
+        $stmt->bind_param("i", $order['id']);
+        $stmt->execute();
+        $r = $stmt->get_result();
+        while ($row = $r->fetch_assoc()) { $history[] = $row; }
+        $stmt->close();
+    }
 }
 
 $conn->close();
 
-// Determine current delivery sub-status
-$currentStatus = $order['status'] ?? '';
-$isPickedUp  = in_array($currentStatus, ['Picked Up', 'In Transit', 'Completed']);
-$isInTransit = in_array($currentStatus, ['In Transit', 'Completed']);
-$isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) == 4;
+// ── Delivery status helpers ────────────────────────────────────
+$deliveryStatus = $order['delivery_status'] ?? '';
+$isPickedUp  = in_array($deliveryStatus, ['picked_up','in_transit','delivered']);
+$isInTransit = in_array($deliveryStatus, ['in_transit','delivered']);
+$isCompleted = $deliveryStatus === 'delivered' || ($order['status'] ?? '') === 'completed';
+
+// ── Delivery status badge helper ───────────────────────────────
+function deliveryBadge(string $ds): array {
+    return match($ds) {
+        'accepted'   => ['label' => 'Accepted',    'color' => '#3b82f6', 'bg' => '#dbeafe'],
+        'picked_up'  => ['label' => 'Picked Up',   'color' => '#f59e0b', 'bg' => '#fef3c7'],
+        'in_transit' => ['label' => 'In Transit',  'color' => '#8b5cf6', 'bg' => '#ede9fe'],
+        'delivered'  => ['label' => 'Delivered',   'color' => '#10b981', 'bg' => '#dcfce7'],
+        default      => ['label' => 'Pending',     'color' => '#6b7280', 'bg' => '#f3f4f6'],
+    };
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -184,18 +245,37 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
         .user-meta p{font-size:.75rem;color:var(--muted);}
         .sign-out{display:flex;align-items:center;gap:.5rem;text-decoration:none;color:var(--muted);font-size:.9rem;padding:.5rem;}
         main{margin-left:var(--sidebar-width);flex:1;padding:2.5rem 3rem;}
-        .header{margin-bottom:2rem;display:flex;justify-content:space-between;align-items:flex-start;}
+        .header{margin-bottom:2rem;}
         .header h2{font-family:'Fraunces',serif;font-size:2rem;margin-bottom:.25rem;}
         .header p{color:var(--muted);}
+
+        /* ── My Deliveries list ── */
+        .deliveries-list{display:flex;flex-direction:column;gap:1rem;margin-bottom:2rem;}
+        .delivery-row{background:white;border:1px solid var(--card-border);border-radius:16px;padding:1.25rem 1.5rem;display:flex;align-items:center;justify-content:space-between;gap:1rem;text-decoration:none;color:var(--foreground);transition:box-shadow .2s,border-color .2s;}
+        .delivery-row:hover{box-shadow:0 4px 16px rgba(0,0,0,.08);border-color:var(--primary);}
+        .dr-left{display:flex;flex-direction:column;gap:.2rem;}
+        .dr-po{font-weight:700;color:var(--primary);font-size:.95rem;}
+        .dr-branch{font-size:.88rem;font-weight:600;}
+        .dr-sub{font-size:.78rem;color:var(--muted);}
+        .dr-right{display:flex;align-items:center;gap:.75rem;flex-shrink:0;}
+        .status-badge{display:inline-flex;align-items:center;gap:.35rem;padding:.3rem .75rem;border-radius:999px;font-size:.75rem;font-weight:700;line-height:1;white-space:nowrap;}
+        .status-badge i{width:12px;height:12px;flex-shrink:0;}
+        .dr-arrow{color:var(--muted);}
+        .empty-state{text-align:center;padding:3rem 2rem;background:white;border:1px solid var(--card-border);border-radius:20px;color:var(--muted);}
+        .empty-state h4{color:var(--foreground);margin:.75rem 0 .5rem;font-family:'Fraunces',serif;}
+        .section-title{font-family:'Fraunces',serif;font-size:1.2rem;margin-bottom:1.25rem;display:flex;align-items:center;gap:.5rem;}
+
+        /* ── Detail view ── */
+        .btn-back{display:inline-flex;align-items:center;gap:.5rem;color:var(--primary);text-decoration:none;font-weight:600;font-size:.9rem;margin-bottom:1.5rem;}
         .po-badge{background:var(--background);border:1px solid var(--card-border);padding:.5rem 1rem;border-radius:10px;font-weight:700;color:var(--primary);}
+        .header-detail{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:2rem;}
         .tracking-grid{display:grid;grid-template-columns:1fr 380px;gap:2rem;align-items:start;}
         .card{background:white;border:1px solid var(--card-border);border-radius:20px;padding:2rem;margin-bottom:1.5rem;}
         .card:last-child{margin-bottom:0;}
         .card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;}
         .card-header h3{font-family:'Fraunces',serif;font-size:1.25rem;}
-        /* Status steps */
         .status-stepper{display:flex;flex-direction:column;gap:1rem;}
-        .status-btn{display:flex;align-items:center;gap:1rem;padding:1.25rem;border-radius:16px;border:2px solid var(--card-border);background:white;cursor:pointer;text-align:left;width:100%;font-family:inherit;transition:all .2s;}
+        .status-btn{display:flex;align-items:center;gap:1rem;padding:1.25rem;border-radius:16px;border:2px solid var(--card-border);background:white;text-align:left;width:100%;font-family:inherit;}
         .status-btn .sb-icon{width:48px;height:48px;background:#fdfaf7;border-radius:12px;display:flex;align-items:center;justify-content:center;color:var(--muted);flex-shrink:0;}
         .status-btn h4{font-size:1rem;margin-bottom:.2rem;}
         .status-btn p{font-size:.8rem;color:var(--muted);}
@@ -206,35 +286,33 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
         .status-btn.current .sb-icon{background:rgba(255,255,255,.15);color:white;}
         .status-btn.current h4{color:white;}
         .status-btn.current p{color:rgba(255,255,255,.8);}
-        .status-btn:disabled{opacity:.5;cursor:not-allowed;}
-        /* Form */
-        .form-group{margin-bottom:1.25rem;}
-        .form-group label{display:block;font-size:.85rem;font-weight:600;color:var(--muted);margin-bottom:.5rem;}
-        .form-group textarea{width:100%;padding:.875rem 1rem;border-radius:12px;border:1.5px solid var(--card-border);font-family:inherit;font-size:.9rem;outline:none;resize:none;}
-        .form-group textarea:focus{border-color:var(--primary);}
+        .pod-upload-area{border:2px dashed var(--card-border);border-radius:16px;padding:1.5rem;text-align:center;cursor:pointer;transition:all .2s;background:#fdfaf7;margin-bottom:1.25rem;}
+        .pod-upload-area:hover,.pod-upload-area.dragover{border-color:var(--primary);background:rgba(92,64,51,.04);}
+        .pod-upload-area .upload-icon{display:block;margin:0 auto .75rem;color:var(--muted);}
+        .pod-upload-area p{font-size:.875rem;color:var(--muted);margin-bottom:.25rem;}
+        .pod-upload-area span{font-size:.75rem;color:var(--muted);opacity:.7;}
+        #pod_photo{display:none;}
+        .pod-preview{margin-bottom:1.25rem;border-radius:16px;overflow:hidden;border:1.5px solid var(--card-border);position:relative;background:#f7f3f0;}
+        .pod-preview img{width:100%;display:block;max-height:480px;object-fit:contain;}
+        .pod-preview-remove{position:absolute;top:.5rem;right:.5rem;background:rgba(0,0,0,.6);color:white;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+        .pod-label{font-size:.85rem;font-weight:600;color:var(--muted);margin-bottom:.5rem;display:flex;align-items:center;gap:.35rem;}
+        .pod-required{background:#fee2e2;color:#b91c1c;font-size:.7rem;padding:.15rem .45rem;border-radius:6px;font-weight:700;}
         .btn-action{width:100%;background:var(--primary);color:white;border:none;padding:1rem;border-radius:12px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.95rem;display:flex;align-items:center;justify-content:center;gap:.5rem;transition:background .2s;}
         .btn-action:hover{background:var(--primary-light);}
-        .btn-delivered{background:#10b981;}
-        .btn-delivered:hover{opacity:.9;background:#10b981;}
-        /* Order details */
+        .btn-delivered{background:var(--primary);}
+        .btn-delivered:hover{background:var(--primary-light);opacity:1;}
         .detail-row{display:flex;justify-content:space-between;margin-bottom:.875rem;font-size:.9rem;}
         .detail-row .dl{color:var(--muted);}
         .detail-row .dv{font-weight:600;}
         .items-list{margin-top:1rem;border-top:1px solid var(--card-border);padding-top:1rem;}
         .item-line{display:flex;justify-content:space-between;font-size:.875rem;padding:.4rem 0;border-bottom:1px dashed var(--card-border);}
         .item-line:last-child{border-bottom:none;}
-        /* History feed */
-        .hist-item{display:flex;gap:1rem;padding-bottom:1.5rem;position:relative;}
-        .hist-item:not(:last-child)::before{content:'';position:absolute;left:11px;top:24px;bottom:0;width:2px;background:#eeeae6;}
-        .hist-dot{width:24px;height:24px;border-radius:50%;background:#eeeae6;flex-shrink:0;z-index:1;}
-        .hist-item.latest .hist-dot{background:var(--primary);}
-        .hist-content h5{font-size:.92rem;margin-bottom:.2rem;}
-        .hist-content p{font-size:.82rem;color:var(--muted);}
-        .hist-time{font-size:.75rem;color:var(--muted);opacity:.7;display:block;margin-top:.2rem;}
+
         .alert-success{background:#dcfce7;border:1px solid #86efac;color:#166534;padding:.875rem 1rem;border-radius:10px;margin-bottom:1.5rem;display:flex;align-items:center;gap:.75rem;font-size:.9rem;}
-        .empty-state{text-align:center;padding:4rem 2rem;color:var(--muted);}
-        .empty-state h4{color:var(--foreground);margin:.75rem 0 .5rem;font-family:'Fraunces',serif;}
-        .btn-back{display:inline-flex;align-items:center;gap:.5rem;color:var(--primary);text-decoration:none;font-weight:600;font-size:.9rem;margin-bottom:1.5rem;}
+        .alert-error{background:#fee2e2;border:1px solid #fca5a5;color:#b91c1c;padding:.875rem 1rem;border-radius:10px;margin-bottom:1.5rem;display:flex;align-items:center;gap:.75rem;font-size:.9rem;}
+        .pod-completed{margin-top:1rem;border-radius:12px;overflow:hidden;border:1.5px solid #86efac;background:#f0fdf4;}
+        .pod-completed img{width:100%;display:block;max-height:480px;object-fit:contain;}
+        .pod-completed-label{font-size:.78rem;color:#166534;font-weight:600;padding:.4rem .75rem;background:#dcfce7;display:flex;align-items:center;gap:.35rem;}
     </style>
 </head>
 <body>
@@ -252,21 +330,16 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
 </aside>
 
 <main>
-    <?php if (!$order): ?>
-    <div class="header"><div><h2>Delivery Tracking</h2><p>No active delivery found.</p></div></div>
-    <div class="empty-state">
-        <i data-lucide="package" size="48" style="opacity:.2;display:block;margin:0 auto;"></i>
-        <h4>Nothing to track right now</h4>
-        <p>Go to your assignments and start a delivery first.</p>
-        <a href="rider-assignment.php" style="display:inline-block;margin-top:1.5rem;background:var(--primary);color:white;padding:.75rem 1.5rem;border-radius:12px;text-decoration:none;font-weight:600;">← Back to Assignments</a>
-    </div>
-    <?php else: ?>
 
-    <div class="header">
+<?php if ($order && $selectedPO): ?>
+    <?php /* ══════════════ DETAIL VIEW ══════════════ */ ?>
+
+    <a href="rider-tracking.php" class="btn-back"><i data-lucide="arrow-left" size="16"></i> My Deliveries</a>
+
+    <div class="header-detail">
         <div>
-            <a href="rider-assignment.php" class="btn-back"><i data-lucide="arrow-left" size="16"></i> Assignments</a>
-            <h2>Delivery Status Update</h2>
-            <p><?php echo htmlspecialchars($order['franchisee_name'] ?? '—'); ?> — <?php echo htmlspecialchars($order['branch_name'] ?? '—'); ?></p>
+            <h2 style="font-family:'Fraunces',serif;font-size:2rem;margin-bottom:.25rem;">Delivery Status Update</h2>
+            <p style="color:var(--muted);"><?php echo htmlspecialchars($order['franchisee_name'] ?? '—'); ?> — <?php echo htmlspecialchars($order['branch_name'] ?? '—'); ?></p>
         </div>
         <span class="po-badge"><?php echo htmlspecialchars($order['po_number']); ?></span>
     </div>
@@ -274,9 +347,14 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
     <?php if ($actionMsg): ?>
     <div class="alert-success"><i data-lucide="check-circle" size="18"></i><span>Status updated to <strong><?php echo htmlspecialchars($actionMsg); ?></strong>.</span></div>
     <?php endif; ?>
+    <?php if ($errorMsg): ?>
+    <div class="alert-error"><i data-lucide="alert-circle" size="18"></i><span><?php echo htmlspecialchars($errorMsg); ?></span></div>
+    <?php endif; ?>
+    <?php if (isset($_GET['done'])): ?>
+    <div class="alert-success"><i data-lucide="check-circle" size="18"></i><span>Order marked as delivered successfully.</span></div>
+    <?php endif; ?>
 
     <div class="tracking-grid">
-        <!-- LEFT: Status Controls -->
         <div>
             <div class="card">
                 <div class="card-header"><h3>Update Progress</h3></div>
@@ -287,10 +365,22 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                     <strong style="font-size:1.1rem;">Delivery Completed</strong><br>
                     <span style="font-size:.875rem;">This order has been successfully delivered.</span>
                 </div>
+                <?php if (!empty($order['pod_photo'])): ?>
+                <div class="pod-completed" style="margin-top:1.25rem;">
+                    <div class="pod-completed-label"><i data-lucide="camera" size="13"></i> Proof of Delivery</div>
+                    <?php
+                        $podSrc = $order['pod_photo'];
+                        if (!str_starts_with($podSrc, '/') && !str_starts_with($podSrc, 'http')) {
+                            $podSrc = '/thesis/' . $podSrc;
+                        }
+                    ?>
+                    <img src="<?php echo htmlspecialchars($podSrc); ?>" alt="Proof of Delivery" style="max-width:100%;border-radius:8px;">
+                </div>
+                <?php endif; ?>
+
                 <?php else: ?>
 
                 <div class="status-stepper">
-                    <!-- Step 1: Picked Up -->
                     <div class="status-btn <?php echo $isPickedUp ? 'done' : 'current'; ?>">
                         <div class="sb-icon"><i data-lucide="package-check" size="22"></i></div>
                         <div>
@@ -298,8 +388,6 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                             <p><?php echo $isPickedUp ? 'Collected from warehouse ✓' : 'Mark when collected from warehouse'; ?></p>
                         </div>
                     </div>
-
-                    <!-- Step 2: In Transit -->
                     <div class="status-btn <?php echo $isInTransit ? 'done' : ($isPickedUp ? 'current' : ''); ?>">
                         <div class="sb-icon"><i data-lucide="truck" size="22"></i></div>
                         <div>
@@ -307,9 +395,7 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                             <p><?php echo $isInTransit ? 'En route to destination ✓' : 'Mark when heading to branch'; ?></p>
                         </div>
                     </div>
-
-                    <!-- Step 3: Delivered -->
-                    <div class="status-btn <?php echo $isCompleted ? 'done' : ''; ?>">
+                    <div class="status-btn">
                         <div class="sb-icon"><i data-lucide="flag" size="22"></i></div>
                         <div>
                             <h4>Delivered</h4>
@@ -318,13 +404,9 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                     </div>
                 </div>
 
-                <!-- Action form -->
-                <form method="POST" action="rider-tracking.php" style="margin-top:1.5rem;">
+                <form method="POST" action="rider-tracking.php?po=<?php echo urlencode($order['po_number']); ?>"
+                      enctype="multipart/form-data" style="margin-top:1.5rem;" id="deliveryForm">
                     <input type="hidden" name="po" value="<?php echo htmlspecialchars($order['po_number']); ?>">
-                    <div class="form-group">
-                        <label>Delivery Notes (optional)</label>
-                        <textarea name="notes" rows="3" placeholder="Add delivery notes, special instructions, or remarks..."></textarea>
-                    </div>
 
                     <?php if (!$isPickedUp): ?>
                     <button type="submit" name="action" value="pickedup" class="btn-action">
@@ -337,7 +419,24 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                     </button>
 
                     <?php else: ?>
-                    <button type="submit" name="action" value="complete" class="btn-action btn-delivered">
+                    <div class="pod-label">
+                        <i data-lucide="camera" size="15"></i> Proof of Delivery Photo
+                        <span class="pod-required">REQUIRED</span>
+                    </div>
+                    <div class="pod-preview" id="podPreview" style="display:none;">
+                        <img id="podPreviewImg" src="" alt="Preview">
+                        <button type="button" class="pod-preview-remove" id="podRemoveBtn" title="Remove photo">
+                            <i data-lucide="x" size="14"></i>
+                        </button>
+                    </div>
+                    <div class="pod-upload-area" id="podUploadArea">
+                        <i data-lucide="upload-cloud" size="36" class="upload-icon"></i>
+                        <p>Tap to take a photo or choose from gallery</p>
+                        <span>JPEG / PNG / WebP — max 5 MB</span>
+                    </div>
+                    <input type="file" name="pod_photo" id="pod_photo" accept="image/*" capture="environment">
+                    <button type="submit" name="action" value="complete"
+                            class="btn-action btn-delivered" id="confirmBtn">
                         <i data-lucide="check-circle" size="18"></i> Confirm Delivery Complete
                     </button>
                     <?php endif; ?>
@@ -345,33 +444,26 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
                 <?php endif; ?>
             </div>
 
-            <!-- Status History -->
-            <?php if (!empty($history)): ?>
-            <div class="card">
-                <div class="card-header"><h3>Status Timeline</h3></div>
-                <?php foreach ($history as $idx => $h): ?>
-                <div class="hist-item <?php echo $idx === 0 ? 'latest' : ''; ?>">
-                    <div class="hist-dot"></div>
-                    <div class="hist-content">
-                        <h5><?php echo htmlspecialchars($h['status_label']); ?></h5>
-                        <p><?php echo htmlspecialchars($h['detail']); ?></p>
-                        <span class="hist-time"><?php echo date('M d, Y h:i A', strtotime($h['changed_at'])); ?></span>
-                    </div>
-                </div>
-                <?php endforeach; ?>
-            </div>
-            <?php endif; ?>
+
         </div>
 
-        <!-- RIGHT: Order Details -->
         <div class="card" style="position:sticky;top:2rem;">
             <div class="card-header"><h3>Order Details</h3></div>
             <div class="detail-row"><span class="dl">Franchisee</span><span class="dv"><?php echo htmlspecialchars($order['franchisee_name'] ?? '—'); ?></span></div>
             <div class="detail-row"><span class="dl">Branch</span><span class="dv"><?php echo htmlspecialchars($order['branch_name'] ?? '—'); ?></span></div>
             <div class="detail-row"><span class="dl">Delivery Type</span><span class="dv"><?php echo htmlspecialchars($order['delivery_preference']); ?></span></div>
+            <div class="detail-row"><span class="dl">Payment Method</span>
+                <span class="dv">
+                <?php
+                $pm = strtolower($order['payment_method'] ?? '');
+                $isCod = $pm === 'cod';
+                echo '<span style="background:' . ($isCod ? '#fef3c7' : '#dcfce7') . ';color:' . ($isCod ? '#92400e' : '#166534') . ';font-size:.75rem;font-weight:700;padding:.2rem .6rem;border-radius:20px;">'
+                    . ($isCod ? '💵 ' : '✓ ') . htmlspecialchars($order['payment_method'] ?? '—') . '</span>';
+                ?>
+                </span>
+            </div>
             <div class="detail-row"><span class="dl">Est. Date</span><span class="dv"><?php echo $order['estimated_pickup'] ? date('M d, Y', strtotime($order['estimated_pickup'])) : '—'; ?></span></div>
             <div class="detail-row"><span class="dl">Order Date</span><span class="dv"><?php echo date('M d, Y', strtotime($order['created_at'])); ?></span></div>
-
             <div class="items-list">
                 <p style="font-size:.85rem;font-weight:700;margin-bottom:.75rem;">Items (<?php echo count($orderItems); ?>)</p>
                 <?php foreach ($orderItems as $item): ?>
@@ -387,8 +479,140 @@ $isCompleted = $currentStatus === 'Completed' || ($order['status_step'] ?? 0) ==
             </div>
         </div>
     </div>
+
+<?php else: ?>
+    <?php /* ══════════════ LIST VIEW ══════════════ */ ?>
+
+    <div class="header">
+        <h2>My Deliveries</h2>
+        <p>Tap an order below to update its delivery status.</p>
+    </div>
+
+    <?php if (isset($_GET['done'])): ?>
+    <div class="alert-success"><i data-lucide="check-circle" size="18"></i><span>Order marked as delivered successfully.</span></div>
     <?php endif; ?>
+
+    <h3 class="section-title"><i data-lucide="map-pin" size="20"></i> Active Deliveries</h3>
+
+    <?php if (empty($myOrders)): ?>
+    <div class="empty-state">
+        <i data-lucide="package" size="40" style="opacity:.2;display:block;margin:0 auto;"></i>
+        <h4>No active deliveries</h4>
+        <p>Accept orders from <a href="rider-assignment.php" style="color:var(--primary);font-weight:600;">Assignments</a> to see them here.</p>
+    </div>
+    <?php else: ?>
+    <div class="deliveries-list">
+        <?php foreach ($myOrders as $mo):
+            $badge = deliveryBadge($mo['delivery_status'] ?? '');
+        ?>
+        <a href="rider-tracking.php?po=<?php echo urlencode($mo['po_number']); ?>" class="delivery-row">
+            <div class="dr-left">
+                <span class="dr-po"><?php echo htmlspecialchars($mo['po_number']); ?></span>
+                <span class="dr-branch"><?php echo htmlspecialchars($mo['franchisee_name']); ?></span>
+                <span class="dr-sub"><?php echo htmlspecialchars($mo['branch_name'] ?? '—'); ?>
+                    <?php if ($mo['estimated_pickup']): ?> · Est. <?php echo date('M d', strtotime($mo['estimated_pickup'])); ?><?php endif; ?>
+                </span>
+            </div>
+            <div class="dr-right">
+                <span class="status-badge"
+                      style="background:<?php echo $badge['bg']; ?>;color:<?php echo $badge['color']; ?>;">
+                    <i data-lucide="circle" style="fill:<?php echo $badge['color']; ?>;stroke:none;"></i>
+                    <?php echo $badge['label']; ?>
+                </span>
+                <i data-lucide="chevron-right" class="dr-arrow" size="18"></i>
+            </div>
+        </a>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+
+<?php endif; ?>
 </main>
-<script>lucide.createIcons();</script>
+
+<script>
+lucide.createIcons();
+
+(function () {
+    const area       = document.getElementById('podUploadArea');
+    const input      = document.getElementById('pod_photo');
+    const preview    = document.getElementById('podPreview');
+    const previewImg = document.getElementById('podPreviewImg');
+    const removeBtn  = document.getElementById('podRemoveBtn');
+
+    if (!area) return;
+
+    area.addEventListener('click', () => input.click());
+    area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('dragover'); });
+    area.addEventListener('dragleave', () => area.classList.remove('dragover'));
+    area.addEventListener('drop', e => {
+        e.preventDefault(); area.classList.remove('dragover');
+        if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+    });
+    input.addEventListener('change', () => { if (input.files[0]) setFile(input.files[0]); });
+    removeBtn.addEventListener('click', () => {
+        input.value = '';
+        previewImg.src = '';
+        preview.style.display = 'none';
+        area.style.display = '';
+        lucide.createIcons();
+    });
+
+    document.getElementById('deliveryForm')?.addEventListener('submit', function (e) {
+        if (e.submitter?.value === 'complete' && !input.files[0]) {
+            e.preventDefault();
+
+            // Remove any existing inline error first
+            const existing = document.getElementById('podInlineError');
+            if (existing) existing.remove();
+
+            // Build styled error banner
+            const err = document.createElement('div');
+            err.id = 'podInlineError';
+            err.style.cssText = [
+                'display:flex','align-items:center','gap:.65rem',
+                'background:#fff1f2','border:1.5px solid #fca5a5',
+                'color:#b91c1c','border-radius:12px','padding:.9rem 1.1rem',
+                'font-size:.875rem','font-weight:600','margin-bottom:1rem'
+            ].join(';');
+            err.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
+                + '<span>Proof of delivery photo is required. Please upload an image before confirming.</span>';
+
+            // Insert the error banner just above the upload area
+            area.parentNode.insertBefore(err, area);
+
+            // Highlight the upload area border in red
+            area.style.border = '2px dashed #ef4444';
+            area.style.background = '#fff1f2';
+
+            // Auto-clear the highlight when a file is chosen
+            input.addEventListener('change', function clearErr() {
+                const el = document.getElementById('podInlineError');
+                if (el) el.remove();
+                area.style.border = '';
+                area.style.background = '';
+                input.removeEventListener('change', clearErr);
+            }, { once: true });
+
+            err.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    });
+
+    function setFile(file) {
+        const reader = new FileReader();
+        reader.onload = ev => {
+            previewImg.src = ev.target.result;
+            preview.style.display = 'block';
+            area.style.display = 'none';
+            lucide.createIcons();
+        };
+        reader.readAsDataURL(file);
+        if (file !== input.files[0]) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            input.files = dt.files;
+        }
+    }
+})();
+</script>
 </body>
 </html>

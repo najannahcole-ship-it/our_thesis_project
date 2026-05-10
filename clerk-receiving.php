@@ -26,6 +26,7 @@ $clerkUserId = $_SESSION['user_id'];
 // ----------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
+    ob_start(); // buffer any stray PHP warnings so they don't corrupt JSON
     header('Content-Type: application/json');
 
     $action = $_POST['action'];
@@ -36,21 +37,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $batchNumber  = trim($_POST['batch_number']   ?? '');
         $productId    = (int) ($_POST['product_id']   ?? 0);
         $quantity     = (float)($_POST['quantity']    ?? 0);
-        $unit         = trim($_POST['unit']           ?? '');
-        $arrivalDate  = trim($_POST['arrival_date']   ?? '');
         $mfgDate      = trim($_POST['mfg_date']       ?? '') ?: null;
         $expiryDate   = trim($_POST['expiry_date']    ?? '') ?: null;
         $qcNotes      = trim($_POST['qc_notes']       ?? '') ?: null;
+        $arrivalDate  = date('Y-m-d'); // always today
+
+        // Fetch unit from products table (not from user input)
+        $unit = '';
+        $uStmt = $conn->prepare("SELECT unit FROM products WHERE id = ? LIMIT 1");
+        $uStmt->bind_param("i", $productId);
+        $uStmt->execute();
+        $uRow = $uStmt->get_result()->fetch_assoc();
+        $uStmt->close();
+        if ($uRow) $unit = $uRow['unit'];
 
         // Basic validation
         $errors = [];
         if (!$batchNumber)  $errors[] = 'Batch number is required.';
         if (!$productId)    $errors[] = 'Please select an item.';
         if ($quantity <= 0) $errors[] = 'Quantity must be greater than 0.';
-        if (!$unit)         $errors[] = 'Unit is required.';
-        if (!$arrivalDate)  $errors[] = 'Arrival date/time is required.';
+        if (!$unit)         $errors[] = 'Selected product has no unit defined.';
 
         if ($errors) {
+            ob_end_clean();
             echo json_encode(['success' => false, 'errors' => $errors]);
             exit();
         }
@@ -61,15 +70,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $chk->execute();
         $chk->store_result();
         if ($chk->num_rows > 0) {
+            ob_end_clean();
             echo json_encode(['success' => false, 'errors' => ["Batch number '$batchNumber' already exists."]]);
             $chk->close();
             exit();
         }
         $chk->close();
 
-        // Insert receipt
         $conn->begin_transaction();
         try {
+            // 1. Insert stock receipt
             $ins = $conn->prepare("
                 INSERT INTO stock_receipts
                     (batch_number, product_id, quantity, unit, source_type,
@@ -84,21 +94,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $receiptId = $conn->insert_id;
             $ins->close();
 
-            // Update products.stock_qty
+            // 2. Insert inventory batch record
+            $bat = $conn->prepare("
+                INSERT INTO inventory_batches
+                    (product_id, batch_number, batch_qty, remaining_qty)
+                VALUES (?, ?, ?, ?)
+            ");
+            $bat->bind_param("isdd",
+                $productId, $batchNumber, $quantity, $quantity
+            );
+            $bat->execute();
+            $bat->close();
+
+            // 3. Get current stock for log
+            $curStmt = $conn->prepare("SELECT stock_qty FROM products WHERE id = ?");
+            $curStmt->bind_param("i", $productId);
+            $curStmt->execute();
+            $curStock = (int)$curStmt->get_result()->fetch_assoc()['stock_qty'];
+            $curStmt->close();
+            $newStock = $curStock + $quantity;
+
+            // 4. Update products.stock_qty
             $upd = $conn->prepare("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?");
             $upd->bind_param("di", $quantity, $productId);
             $upd->execute();
             $upd->close();
 
+            // 5. Log the action in inventory_logs
+            $remarks  = "Stock received — batch {$batchNumber}";
+            $qtyInt   = (int)$quantity; // inventory_logs.quantity is int(11)
+            $log = $conn->prepare("
+                INSERT INTO inventory_logs
+                    (product_id, action, quantity, unit, previous_stock, new_stock, remarks, created_by)
+                VALUES (?, 'add', ?, ?, ?, ?, ?, ?)
+            ");
+            $log->bind_param("iisiisi",
+                $productId, $qtyInt, $unit, $curStock, $newStock, $remarks, $clerkUserId
+            );
+            $log->execute();
+            $log->close();
+
             $conn->commit();
 
+            ob_end_clean();
             echo json_encode([
                 'success'    => true,
                 'receipt_id' => $receiptId,
-                'message'    => 'Receipt recorded and inventory updated successfully.'
+                'message'    => 'Receipt recorded and inventory updated successfully.',
+                'unit'       => $unit,
             ]);
         } catch (\Exception $e) {
             $conn->rollback();
+            ob_end_clean();
             echo json_encode(['success' => false, 'errors' => ['Database error: ' . $e->getMessage()]]);
         }
         exit();
@@ -118,10 +165,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $stmt->execute();
         $row = $stmt->get_result()->fetch_assoc();
         $stmt->close();
+        ob_end_clean();
         echo json_encode($row ?: ['error' => 'Not found']);
         exit();
     }
 
+    ob_end_clean();
     echo json_encode(['error' => 'Unknown action']);
     exit();
 }
@@ -144,22 +193,16 @@ while ($row = $res->fetch_assoc()) $products[] = $row;
 $recentReceipts = [];
 $res = $conn->query("
     SELECT r.id, r.batch_number, r.quantity, r.unit,
-           r.arrival_date, r.mfg_date, r.expiry_date,
+           r.arrival_date, r.mfg_date, r.expiry_date, r.created_at,
            p.name AS product_name,
            u.full_name AS recorded_by_name
     FROM stock_receipts r
     LEFT JOIN products p ON p.id = r.product_id
     LEFT JOIN users    u ON u.user_id = r.recorded_by
-    WHERE r.source_type = 'Internal'
-    ORDER BY r.arrival_date DESC
+    ORDER BY r.created_at DESC
     LIMIT 20
 ");
-while ($row = $res->fetch_assoc()) $recentReceipts[] = $row;
-
-// Summary stats
-$totalToday   = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE DATE(arrival_date) = CURDATE() AND source_type = 'Internal'")->fetch_row()[0];
-$totalMonth   = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE MONTH(arrival_date) = MONTH(CURDATE()) AND YEAR(arrival_date) = YEAR(CURDATE()) AND source_type = 'Internal'")->fetch_row()[0];
-$totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_type = 'Internal'")->fetch_row()[0];
+if ($res) while ($row = $res->fetch_assoc()) $recentReceipts[] = $row;
 
 ?>
 <!DOCTYPE html>
@@ -273,34 +316,6 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
         .header h2 { font-family: 'Fraunces', serif; font-size: 2rem; margin-bottom: 0.25rem; }
         .header p  { color: var(--muted); font-size: 1rem; }
 
-        /* ── Stats row ───────────────────────────────────────── */
-        .stats-row {
-            display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem;
-            margin-bottom: 2rem;
-        }
-        .stat-card {
-            background: white; border: 1px solid var(--card-border);
-            border-radius: 20px; padding: 1.5rem;
-        }
-        .stat-card .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; margin-bottom: 0.5rem; }
-        .stat-card .value { font-family: 'Fraunces', serif; font-size: 2.25rem; color: var(--primary); }
-
-        /* ── Tabs ────────────────────────────────────────────── */
-        .tabs {
-            display: flex; gap: 2rem;
-            border-bottom: 1px solid var(--card-border); margin-bottom: 2rem;
-        }
-        .tab {
-            padding: 1rem 0.5rem; font-weight: 600; color: var(--muted);
-            cursor: pointer; position: relative; text-decoration: none;
-            background: none; border: none; font-family: inherit; font-size: 0.95rem;
-        }
-        .tab.active { color: var(--primary); }
-        .tab.active::after {
-            content: ''; position: absolute; bottom: -1px; left: 0; right: 0;
-            height: 2px; background: var(--primary);
-        }
-
         /* ── Card / Form ─────────────────────────────────────── */
         .card {
             background: white; border: 1px solid var(--card-border);
@@ -331,10 +346,6 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
             outline: none; border-color: var(--accent); background: white;
             box-shadow: 0 0 0 4px rgba(210,84,36,0.05);
         }
-        .qty-row { display: flex; gap: 0.5rem; }
-        .qty-row input  { flex: 1; }
-        .qty-row select { width: 110px; }
-
         .btn-group { display: flex; justify-content: flex-end; gap: 1rem; margin-top: 2rem; }
         .btn {
             padding: 0.875rem 2rem; border-radius: 12px; font-weight: 600;
@@ -484,32 +495,8 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
     <div class="header">
         <div>
             <h2 data-testid="text-page-title">Stock Receiving</h2>
-            <p>Record and track incoming stock from manufacturing and internal sources</p>
+            <p>Record and track incoming stock</p>
         </div>
-    </div>
-
-    <!-- Stats -->
-    <div class="stats-row">
-        <div class="stat-card">
-            <div class="label">Receipts Today</div>
-            <div class="value"><?= $totalToday ?></div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Receipts This Month</div>
-            <div class="value"><?= $totalMonth ?></div>
-        </div>
-        <div class="stat-card">
-            <div class="label">Total Receipts (All-Time)</div>
-            <div class="value"><?= $totalAllTime ?></div>
-        </div>
-    </div>
-
-    <!-- Tabs -->
-    <div class="tabs">
-        <button class="tab active" data-testid="tab-internal-supplier">
-            Internal Supplier (Manufacturing)
-        </button>
-
     </div>
 
     <!-- ── Internal Tab ──────────────────────────────────────── -->
@@ -524,7 +511,7 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
 
             <div class="alert-info">
                 <i data-lucide="info" size="20"></i>
-                <p>Use this form to record stock received from the internal production unit. Batch numbers must match production logs for traceability.</p>
+                <p>Use this form to record stock received from the internal production unit.</p>
             </div>
 
             <!-- Error list (shown on validation fail) -->
@@ -560,7 +547,7 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
                             ?>
                             <option value="<?= $p['id'] ?>"
                                     data-unit="<?= htmlspecialchars($p['unit']) ?>">
-                                <?= htmlspecialchars($p['name']) ?>
+                                <?= htmlspecialchars($p['name']) ?> (<?= htmlspecialchars($p['unit']) ?>)
                             </option>
                             <?php endforeach; if ($lastCat) echo '</optgroup>'; ?>
                         </select>
@@ -568,18 +555,9 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
 
                     <div class="form-group">
                         <label for="quantity">Quantity Received *</label>
-                        <div class="qty-row">
-                            <input id="quantity" name="quantity" type="number"
-                                   placeholder="0" min="0.01" step="0.01"
-                                   data-testid="input-received-qty" required>
-                            <select id="unit" name="unit" data-testid="select-unit">
-                                <option value="g">g</option>
-                                <option value="kg">kg</option>
-                                <option value="ml">ml</option>
-                                <option value="L">L</option>
-                                <option value="pcs">pcs</option>
-                            </select>
-                        </div>
+                        <input id="quantity" name="quantity" type="number"
+                               placeholder="0" min="1" step="1"
+                               data-testid="input-received-qty" required>
                     </div>
 
                     <div class="form-group">
@@ -595,7 +573,7 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
                     </div>
 
                     <div class="form-group full-width">
-                        <label for="qc_notes">Quality Control Notes / Condition</label>
+                        <label for="qc_notes">Quality Control Notes / Condition <span style="font-weight:400;text-transform:none;letter-spacing:0;">(optional)</span></label>
                         <textarea id="qc_notes" name="qc_notes" rows="3"
                                   placeholder="Describe the condition of received stock, seal integrity, etc."
                                   data-testid="textarea-qc-notes"></textarea>
@@ -627,10 +605,11 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
                 <thead>
                     <tr>
                         <th>Batch #</th>
-                        <th>Item Name</th>
+                        <th>Item</th>
                         <th>Qty Received</th>
+                        <th>Mfg Date</th>
                         <th>Expiry Date</th>
-                        <th>Status</th>
+                        <th>Date Recorded</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -647,11 +626,11 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
                 <?php else: foreach ($recentReceipts as $r): ?>
                     <tr data-id="<?= $r['id'] ?>">
                         <td><span class="batch-code"><?= htmlspecialchars($r['batch_number']) ?></span></td>
-                        <td><?= htmlspecialchars($r['product_name']) ?></td>
-                        <td><?= htmlspecialchars($r['quantity'] + 0) ?> <?= htmlspecialchars($r['unit']) ?></td>
-                        <td><?= date('M d, Y g:i A', strtotime($r['arrival_date'])) ?></td>
+                        <td><?= htmlspecialchars($r['product_name'] ?? '—') ?></td>
+                        <td style="font-weight:600;"><?= (int)$r['quantity'] ?> <?= htmlspecialchars($r['unit'] ?? '') ?></td>
+                        <td><?= $r['mfg_date'] ? date('M d, Y', strtotime($r['mfg_date'])) : '—' ?></td>
                         <td><?= $r['expiry_date'] ? date('M d, Y', strtotime($r['expiry_date'])) : '—' ?></td>
-                        <td><span class="status-badge">Recorded</span></td>
+                        <td style="color:var(--muted);font-size:.85rem;"><?= date('M d, Y', strtotime($r['created_at'])) ?></td>
                         <td>
                             <button class="action-btn" title="View Details"
                                     onclick="viewReceipt(<?= $r['id'] ?>)">
@@ -660,6 +639,8 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
                         </td>
                     </tr>
                 <?php endforeach; endif; ?>
+                </tbody>
+            </table>
                 </tbody>
             </table>
         </div>
@@ -688,26 +669,6 @@ $totalAllTime = $conn->query("SELECT COUNT(*) FROM stock_receipts WHERE source_t
 
 <script>
 lucide.createIcons();
-
-// ── Set arrival datetime to now ──────────────────────────────
-(function () {
-    const now = new Date();
-    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-    document.getElementById('arrival_date').value = now.toISOString().slice(0, 16);
-})();
-
-// ── Auto-fill unit when item is selected ─────────────────────
-document.getElementById('product_id').addEventListener('change', function () {
-    const opt  = this.options[this.selectedIndex];
-    const unit = opt.dataset.unit;
-    if (unit) {
-        const sel = document.getElementById('unit');
-        // Try to find the matching option; if not found, leave as-is
-        for (let i = 0; i < sel.options.length; i++) {
-            if (sel.options[i].value === unit) { sel.selectedIndex = i; break; }
-        }
-    }
-});
 
 // ── Toast ────────────────────────────────────────────────────
 let toastTimer;
@@ -752,18 +713,16 @@ document.getElementById('receivingForm').addEventListener('submit', async functi
         if (data.success) {
             showToast('✓ Receipt recorded & inventory updated!', 'success');
 
-            // Capture product name BEFORE reset clears the dropdown
-            const selEl = document.getElementById('product_id');
-            const prodName = selEl.options[selEl.selectedIndex]?.text ?? '—';
+            // Capture product name and unit BEFORE reset clears the dropdown
+            const selEl    = document.getElementById('product_id');
+            const selOpt   = selEl.options[selEl.selectedIndex];
+            const prodName = selOpt?.text ?? '—';
+            const unit     = data.unit || selOpt?.dataset.unit || '';
 
             this.reset();
-            // Reset arrival date
-            const now = new Date();
-            now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-            document.getElementById('arrival_date').value = now.toISOString().slice(0, 16);
 
             // Prepend new row to table
-            prependReceiptRow(data.receipt_id, fd, prodName);
+            prependReceiptRow(data.receipt_id, fd, prodName, unit);
         } else {
             showErrors(data.errors || ['An unknown error occurred.']);
             showToast('Please fix the errors above.', 'error');
@@ -778,30 +737,29 @@ document.getElementById('receivingForm').addEventListener('submit', async functi
 });
 
 // ── Prepend new row into table without reload ─────────────────
-function prependReceiptRow(id, fd, prodName) {
-    const tbody   = document.getElementById('receiptsBody');
+function prependReceiptRow(id, fd, prodName, unit) {
+    const tbody    = document.getElementById('receiptsBody');
     const emptyRow = document.getElementById('emptyRow');
     if (emptyRow) emptyRow.remove();
 
-    const qty      = fd.get('quantity');
-    const unit     = fd.get('unit');
-    const batch    = fd.get('batch_number');
-    const arrival  = new Date(fd.get('arrival_date'));
-    const expiry   = fd.get('expiry_date') ? new Date(fd.get('expiry_date')) : null;
+    const qty     = fd.get('quantity');
+    const batch   = fd.get('batch_number');
+    const mfgRaw  = fd.get('mfg_date');
+    const expRaw  = fd.get('expiry_date');
+    const today   = new Date();
 
-    const fmtDate = (d) => d.toLocaleDateString('en-US', { month:'short', day:'2-digit', year:'numeric' });
-    const fmtDT   = (d) => d.toLocaleDateString('en-US', { month:'short', day:'2-digit', year:'numeric' })
-                          + ' ' + d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' });
+    const fmtDate = (d) => d ? new Date(d + 'T00:00:00').toLocaleDateString('en-US', { month:'short', day:'2-digit', year:'numeric' }) : '—';
+    const fmtNow  = (d) => d.toLocaleDateString('en-US', { month:'short', day:'2-digit', year:'numeric' });
 
     const tr = document.createElement('tr');
     tr.dataset.id = id;
     tr.innerHTML = `
         <td><span class="batch-code">${batch}</span></td>
         <td>${prodName}</td>
-        <td>${qty} ${unit}</td>
-        <td>${fmtDT(arrival)}</td>
-        <td>${expiry ? fmtDate(expiry) : '—'}</td>
-        <td><span class="status-badge">Recorded</span></td>
+        <td style="font-weight:600;">${qty} ${unit}</td>
+        <td>${fmtDate(mfgRaw)}</td>
+        <td>${fmtDate(expRaw)}</td>
+        <td style="color:var(--muted);font-size:.85rem;">${fmtNow(today)}</td>
         <td>
             <button class="action-btn" title="View Details" onclick="viewReceipt(${id})">
                 <i data-lucide="eye" size="18"></i>
@@ -836,9 +794,7 @@ async function viewReceipt(id) {
         body.innerHTML = `
             <div class="detail-item"><div class="label">Batch Number</div><div class="value">${fmt(d.batch_number)}</div></div>
             <div class="detail-item"><div class="label">Item</div><div class="value">${fmt(d.product_name)}</div></div>
-            <div class="detail-item"><div class="label">Quantity</div><div class="value">${fmt(d.quantity)} ${fmt(d.unit)}</div></div>
-            <div class="detail-item"><div class="label">Source</div><div class="value">${fmt(d.source_type)}</div></div>
-            <div class="detail-item"><div class="label">Arrival Date</div><div class="value">${fmtDT(d.arrival_date)}</div></div>
+            <div class="detail-item"><div class="label">Quantity</div><div class="value">${parseInt(d.quantity)} ${fmt(d.unit)}</div></div>
             <div class="detail-item"><div class="label">Manufacturing Date</div><div class="value">${fmtD(d.mfg_date)}</div></div>
             <div class="detail-item"><div class="label">Expiry Date</div><div class="value">${fmtD(d.expiry_date)}</div></div>
             <div class="detail-item"><div class="label">Recorded By</div><div class="value">${fmt(d.recorded_by_name)}</div></div>

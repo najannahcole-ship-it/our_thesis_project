@@ -44,16 +44,7 @@ if ($franchiseeId) {
     }
 
     if (!$order) {
-        // Fall back to most recent non-completed order
-        $stmt = $conn->prepare("SELECT * FROM orders WHERE franchisee_id = ? AND status_step < 4 ORDER BY created_at DESC LIMIT 1");
-        $stmt->bind_param("i", $franchiseeId);
-        $stmt->execute();
-        $order = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-    }
-
-    if (!$order) {
-        // No active orders — try latest order of any status
+        // Fall back to most recent order (including completed)
         $stmt = $conn->prepare("SELECT * FROM orders WHERE franchisee_id = ? ORDER BY created_at DESC LIMIT 1");
         $stmt->bind_param("i", $franchiseeId);
         $stmt->execute();
@@ -84,9 +75,17 @@ if ($franchiseeId) {
         $stmt->close();
     }
 
-    // Fetch active orders list for the PO selector pills (up to 5)
+    // Fetch active orders for the PO selector pills only — exclude completed and rejected
     $activePOs = [];
-    $stmt = $conn->prepare("SELECT po_number, status FROM orders WHERE franchisee_id = ? AND status_step < 4 ORDER BY created_at DESC LIMIT 5");
+    $stmt = $conn->prepare("
+        SELECT po_number, status, status_step
+        FROM orders
+        WHERE franchisee_id = ?
+          AND status_step < 4
+          AND status NOT IN ('completed','rejected','cancelled')
+        ORDER BY created_at DESC
+        LIMIT 8
+    ");
     $stmt->bind_param("i", $franchiseeId);
     $stmt->execute();
     $result = $stmt->get_result();
@@ -97,13 +96,14 @@ if ($franchiseeId) {
 $conn->close();
 
 // Pipeline step definitions — aligned to actual status_step values in DB
-// step 0=Submitted, 1=Under Review, 2=For Payment, 3=Processing, 4=Completed
+// step 0=Submitted, 1=Under Review, 2=For Payment, 3=Processing, 3.5=Out for Delivery, 4=Completed
 $STEPS = [
-    ['label' => 'Submitted',    'icon' => 'file-text'],
-    ['label' => 'Under Review', 'icon' => 'search'],
-    ['label' => 'For Payment',  'icon' => 'credit-card'],
-    ['label' => 'Processing',   'icon' => 'loader'],
-    ['label' => 'Completed',    'icon' => 'flag'],
+    ['label' => 'Submitted',        'icon' => 'file-text'],
+    ['label' => 'Under Review',     'icon' => 'search'],
+    ['label' => 'For Payment',      'icon' => 'credit-card'],
+    ['label' => 'Processing',       'icon' => 'loader'],
+    ['label' => 'Out for Delivery', 'icon' => 'truck'],
+    ['label' => 'Completed',        'icon' => 'flag'],
 ];
 ?>
 <!DOCTYPE html>
@@ -183,7 +183,7 @@ $STEPS = [
 </head>
 <body>
 <aside>
-    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.68rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
+    <div class="logo-container"><div class="logo-icon"><i data-lucide="coffee"></i></div><div class="logo-text"><h1>Top Juan</h1><span>Franchise Portal</span><span style="font-size:.85rem;color:var(--primary);font-weight:600;margin-top:.1rem;display:block;line-height:1;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></span></div></div>
     <div class="menu-label">Menu</div>
     <nav>
         <a href="franchisee-dashboard.php" class="nav-item"><i data-lucide="layout-dashboard"></i> Dashboard</a>
@@ -191,7 +191,7 @@ $STEPS = [
         <a href="item-usage.php" class="nav-item"><i data-lucide="box"></i> Item Usage</a>
         <a href="order-status.php" class="nav-item active"><i data-lucide="package"></i> Order Status</a>
         <a href="returns.php" class="nav-item"><i data-lucide="rotate-ccw"></i> Returns</a>
-        <a href="history.php" class="nav-item"><i data-lucide="history"></i> History</a>
+        <a href="order-history.php" class="nav-item"><i data-lucide="history"></i> Order History</a>
         <a href="profile.php" class="nav-item"><i data-lucide="user"></i> Profile</a>
     </nav>
     <div class="user-profile"><div class="avatar"><i data-lucide="user"></i></div><div class="user-meta"><h4><?php echo htmlspecialchars($fullName); ?></h4><p style="font-size:.72rem;color:var(--muted);font-weight:500;"><?php echo htmlspecialchars($branchName ?? $franchisee['branch_name'] ?? '—'); ?></p></div></div>
@@ -236,12 +236,32 @@ $STEPS = [
     <div class="card" style="margin-bottom:2rem;">
         <div class="pipeline-container">
             <?php
-            $isPaid = strtolower($order['payment_status'] ?? 'unpaid') === 'paid';
+            $isPaid           = strtolower($order['payment_status'] ?? 'unpaid') === 'paid';
+            $isFullyCompleted = intval($order['status_step']) >= 4;
+            $deliveryStatus   = $order['delivery_status'] ?? 'pending';
+            $isOutForDelivery = in_array($deliveryStatus, ['picked_up','in_transit','delivered']) || $isFullyCompleted;
+
+            // STEPS indices: 0=Submitted,1=Review,2=Payment,3=Processing,4=OutForDelivery,5=Completed
             foreach ($STEPS as $i => $step):
                 $cls  = '';
                 $icon = $step['icon'];
-                if ($i < $order['status_step'])      { $cls = 'step-completed'; $icon = 'check'; }
-                elseif ($i == $order['status_step'])  { $cls = 'step-active'; }
+
+                if ($i === 4) {
+                    // Out for Delivery — driven by delivery_status
+                    if ($isFullyCompleted)     { $cls = 'step-completed'; $icon = 'check'; }
+                    elseif ($isOutForDelivery) { $cls = 'step-active'; }
+                } elseif ($i === 5) {
+                    // Completed
+                    if ($isFullyCompleted)     { $cls = 'step-completed'; $icon = 'check'; }
+                } else {
+                    // Steps 0–3: use status_step
+                    // Also mark as completed if Out for Delivery is active (meaning Processing is done)
+                    if ($i < $order['status_step'] || ($isOutForDelivery && $i <= $order['status_step'])) {
+                        $cls = 'step-completed'; $icon = 'check';
+                    } elseif ($i == $order['status_step'] && !$isOutForDelivery && !$isFullyCompleted) {
+                        $cls = 'step-active';
+                    }
+                }
             ?>
             <div class="pipeline-step <?php echo $cls; ?>">
                 <div class="step-dot"><i data-lucide="<?php echo $icon; ?>" size="20"></i></div>
@@ -264,7 +284,20 @@ $STEPS = [
                 <div class="history-item <?php echo $idx === 0 ? 'is-latest' : ''; ?>">
                     <div class="history-dot"></div>
                     <div class="history-content">
-                        <h4><?php echo htmlspecialchars($h['status_label']); ?></h4>
+                        <?php
+                        $labelMap = [
+                            'for_payment'      => 'For Payment',
+                            'out_for_delivery' => 'Out for Delivery',
+                            'Under Review'     => 'Under Review',
+                            'Approved'         => 'Approved',
+                            'Processing'       => 'Processing',
+                            'completed'        => 'Completed',
+                            'Rejected'         => 'Rejected',
+                        ];
+                        $rawLabel     = $h['status_label'];
+                        $friendlyLabel = $labelMap[$rawLabel] ?? $rawLabel;
+                        ?>
+                        <h4><?php echo htmlspecialchars($friendlyLabel); ?></h4>
                         <p><?php echo htmlspecialchars($h['detail']); ?></p>
                         <span class="history-time"><?php echo date('M d, Y • h:i A', strtotime($h['changed_at'])); ?></span>
                     </div>

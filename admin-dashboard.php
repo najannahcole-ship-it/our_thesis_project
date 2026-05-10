@@ -19,57 +19,99 @@ require_once 'db.php';
 // Total orders (all time)
 $totalOrders = $conn->query("SELECT COUNT(*) AS c FROM orders")->fetch_assoc()['c'];
 
-// Pending orders (Under Review)
-$pendingOrders = $conn->query("SELECT COUNT(*) AS c FROM orders WHERE status = 'Under Review'")->fetch_assoc()['c'];
+// Pending orders — status_step 0 = Submitted (awaiting review), 1 = Under Review
+$pendingOrders = $conn->query("SELECT COUNT(*) AS c FROM orders WHERE status_step IN (0, 1)")->fetch_assoc()['c'];
 
 // Active return requests (Pending or Approved, not Resolved/Rejected)
 $activeReturns = $conn->query("SELECT COUNT(*) AS c FROM returns WHERE status IN ('Pending','Approved')")->fetch_assoc()['c'];
 
 // Active franchisee branches
-$activeBranches = $conn->query("SELECT COUNT(*) AS c FROM franchisees")->fetch_assoc()['c'];
+$activeBranches = $conn->query("SELECT COUNT(*) AS c FROM franchisees WHERE status = 'active'")->fetch_assoc()['c'];
 
 // ── Recent Order Requests (latest 5) ─────────────────────────
 $recentOrders = [];
 $roRes = $conn->query("
-    SELECT o.id, o.po_number, o.status, o.total_amount, o.created_at,
-           COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
-           f.branch_name
+    SELECT o.id, o.po_number, o.status, o.status_step, o.total_amount, o.created_at,
+           COALESCE(f.franchisee_name, u.full_name, f.branch_name, 'Unknown') AS franchisee_name,
+           COALESCE(f.branch_name, 'Unknown Branch') AS branch_name
     FROM orders o
-    JOIN franchisees f ON f.id = o.franchisee_id
-    LEFT JOIN users uf ON uf.user_id = f.user_id
+    LEFT JOIN franchisees f ON f.id = o.franchisee_id
+    LEFT JOIN users u ON u.user_id = f.user_id
     ORDER BY o.created_at DESC
     LIMIT 5
 ");
-while ($row = $roRes->fetch_assoc()) { $recentOrders[] = $row; }
+if ($roRes) while ($row = $roRes->fetch_assoc()) { $recentOrders[] = $row; }
+
+// Helper: convert raw DB status to a readable label
+function statusLabel($status) {
+    $map = [
+        // status_step integers
+        '0' => 'Submitted',
+        '1' => 'Under Review',
+        '2' => 'Processing',
+        '3' => 'Ready',
+        '4' => 'Completed',
+        '-1'=> 'Rejected',
+        // DB enum values
+        'pending'          => 'Pending',
+        'for_approval'     => 'For Approval',
+        'for_payment'      => 'For Payment',
+        'paid'             => 'Paid',
+        'processing'       => 'Processing',
+        'out_for_delivery' => 'Out for Delivery',
+        'completed'        => 'Completed',
+        'cancelled'        => 'Cancelled',
+        'Under Review'     => 'Under Review',
+        'Approved'         => 'Approved',
+        'Rejected'         => 'Rejected',
+        'Completed'        => 'Completed',
+    ];
+    return $map[$status] ?? ucfirst(str_replace('_', ' ', $status));
+}
 
 // ── Recent Activity Feed (latest 8 status history entries) ───
 $recentActivity = [];
 $raRes = $conn->query("
     SELECT h.status_label, h.detail, h.changed_at,
            o.po_number,
-           u.full_name AS changed_by_name
+           COALESCE(u.full_name, 'System') AS changed_by_name
     FROM order_status_history h
-    JOIN orders o ON o.id = h.order_id
+    LEFT JOIN orders o ON o.id = h.order_id
     LEFT JOIN users u ON u.user_id = h.changed_by
     ORDER BY h.changed_at DESC
     LIMIT 8
 ");
-while ($row = $raRes->fetch_assoc()) { $recentActivity[] = $row; }
+if ($raRes) while ($row = $raRes->fetch_assoc()) { $recentActivity[] = $row; }
 
-// ── Encoder Workload Summary ──────────────────────────────────
-$encoderSummary = [];
-$ewRes = $conn->query("
-    SELECT u.full_name,
-           COUNT(o.id) AS active_orders
-    FROM users u
-    LEFT JOIN orders o
-        ON o.assigned_encoder_id = u.user_id
-        AND o.status NOT IN ('completed','Rejected')
-    WHERE u.role_id = 4 AND u.status = 'Active'
-    GROUP BY u.user_id, u.full_name
-    ORDER BY active_orders DESC, u.full_name ASC
+
+// ── Most Active Branches ──────────────────────────────────────
+$topBranchesRes = $conn->query("
+    SELECT iu.franchisee_id,
+           COALESCE(f.franchisee_name, u.full_name, f.branch_name, 'Unknown') AS franchisee_name,
+           COALESCE(f.branch_name, CONCAT('Branch #', f.id), 'Unknown Branch') AS branch_name,
+           COUNT(iu.id) AS submissions
+    FROM item_usage iu
+    LEFT JOIN franchisees f ON f.id = iu.franchisee_id
+    LEFT JOIN users u ON u.user_id = f.user_id
+    GROUP BY iu.franchisee_id, f.branch_name, f.franchisee_name, u.full_name
+    ORDER BY submissions DESC
+    LIMIT 5
 ");
-while ($row = $ewRes->fetch_assoc()) { $encoderSummary[] = $row; }
+$topBranches = [];
+if ($topBranchesRes) while ($row = $topBranchesRes->fetch_assoc()) { $topBranches[] = $row; }
+
+$topItemsRes = $conn->query("
+    SELECT p.name AS product_name, p.category,
+           SUM(iu.quantity_used) AS total_qty, iu.unit,
+           COUNT(iu.id) AS submission_count
+    FROM item_usage iu
+    LEFT JOIN products p ON p.id = iu.product_id
+    GROUP BY iu.product_id, p.name, p.category, iu.unit
+    ORDER BY total_qty DESC
+    LIMIT 5
+");
+$topItems = [];
+if ($topItemsRes) while ($row = $topItemsRes->fetch_assoc()) { $topItems[] = $row; }
 
 $conn->close();
 
@@ -98,15 +140,28 @@ function activityIcon($label) {
 
 function statusPillClass($status) {
     $map = [
+        // status_step integers
+        '0'  => 'pill-pending',
+        '1'  => 'pill-review',
+        '2'  => 'pill-processing',
+        '3'  => 'pill-approved',
+        '4'  => 'pill-completed',
+        '-1' => 'pill-rejected',
+        // DB enum values
+        'pending'          => 'pill-pending',
+        'for_approval'     => 'pill-review',
+        'for_payment'      => 'pill-review',
+        'paid'             => 'pill-approved',
+        'processing'       => 'pill-processing',
+        'out_for_delivery' => 'pill-processing',
+        'completed'        => 'pill-completed',
+        'cancelled'        => 'pill-rejected',
         'Under Review'     => 'pill-review',
         'Approved'         => 'pill-approved',
-        'for_payment'      => 'pill-payment',
-        'Processing'       => 'pill-processing',
-        'out_for_delivery' => 'pill-delivery',
-        'completed'        => 'pill-completed',
         'Rejected'         => 'pill-rejected',
+        'Completed'        => 'pill-completed',
     ];
-    return $map[$status] ?? 'pill-review';
+    return $map[$status] ?? 'pill-pending';
 }
 ?>
 <!DOCTYPE html>
@@ -204,13 +259,12 @@ function statusPillClass($status) {
         tr:last-child td { border-bottom: none; }
 
         .status-pill { padding: 0.3rem 0.65rem; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }
-        .pill-review   { background: #fffbeb; color: #b45309; }
-        .pill-approved { background: #f0fdf4; color: #166534; }
-        .pill-payment  { background: #eff6ff; color: #1d4ed8; }
-        .pill-processing{ background: rgba(210,84,36,.1); color: #d25424; }
-        .pill-delivery { background: #fdf4ff; color: #7e22ce; }
-        .pill-completed{ background: #f3f4f6; color: #4b5563; }
-        .pill-rejected { background: #fef2f2; color: #991b1b; }
+        .pill-pending    { background: #f3f4f6; color: #374151; }
+        .pill-review     { background: #fffbeb; color: #b45309; }
+        .pill-approved   { background: #f0fdf4; color: #166534; }
+        .pill-rejected   { background: #fef2f2; color: #991b1b; }
+        .pill-completed  { background: #eff6ff; color: #1d4ed8; }
+        .pill-processing { background: #f0f9ff; color: #0369a1; }
 
         .empty-state { text-align: center; padding: 2.5rem; color: var(--muted); font-size: 0.9rem; }
 
@@ -222,18 +276,18 @@ function statusPillClass($status) {
         .activity-content p { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.15rem; line-height: 1.4; }
         .activity-content span { font-size: 0.72rem; color: var(--muted); opacity: 0.75; }
 
-        /* ── Encoder Workload Card ── */
-        .encoder-row { display: flex; align-items: center; justify-content: space-between; padding: 0.85rem 0; border-bottom: 1px solid var(--card-border); }
-        .encoder-row:last-child { border-bottom: none; }
-        .encoder-row-left { display: flex; align-items: center; gap: 0.65rem; }
-        .enc-avatar { width: 30px; height: 30px; border-radius: 50%; background: #eff6ff; display: flex; align-items: center; justify-content: center; color: #1d4ed8; flex-shrink: 0; }
-        .enc-name { font-weight: 600; font-size: 0.88rem; }
-        .workload-bar-wrap { flex: 1; margin: 0 1rem; height: 6px; background: var(--card-border); border-radius: 99px; overflow: hidden; }
-        .workload-bar { height: 100%; border-radius: 99px; transition: width 0.4s ease; }
-        .bar-free  { background: #22c55e; }
-        .bar-busy  { background: #f59e0b; }
-        .bar-heavy { background: #ef4444; }
-        .enc-count { font-size: 0.8rem; font-weight: 700; color: var(--muted); min-width: 48px; text-align: right; }
+        /* ── Usage Rankings ── */
+        .rank-list { display: flex; flex-direction: column; margin: 0 -2rem; }
+        .rank-item { display: flex; align-items: center; gap: 1rem; padding: 1rem 2rem; border-bottom: 1px solid var(--card-border); text-decoration: none; color: inherit; transition: background 0.15s; }
+        .rank-item:last-child { border-bottom: none; }
+        .rank-item:hover { background: var(--background); }
+        .rank-num { width: 28px; height: 28px; border-radius: 8px; background: var(--background); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.8rem; color: var(--muted); flex-shrink: 0; }
+        .rank-num.top { background: var(--primary); color: white; }
+        .rank-info { flex: 1; }
+        .rank-info h4 { font-size: 0.9rem; font-weight: 600; margin-bottom: 0.1rem; }
+        .rank-info p { font-size: 0.78rem; color: var(--muted); }
+        .rank-qty { font-weight: 700; font-size: 0.9rem; color: var(--primary); text-align: right; }
+        .rank-qty span { display: block; font-size: 0.75rem; color: var(--muted); font-weight: 400; }
 
         @media (max-width: 1200px) {
             .summary-grid { grid-template-columns: repeat(2, 1fr); }
@@ -304,12 +358,71 @@ function statusPillClass($status) {
                 <div class="value" style="<?php echo $activeReturns > 0 ? 'color:#ef4444;' : ''; ?>"><?php echo $activeReturns; ?></div>
                 <p class="subtext"><?php echo $activeReturns > 0 ? 'Awaiting processing' : 'No active returns'; ?></p>
             </a>
-            <a href="admin-orders.php" class="summary-card">
+            <a href="admin-maintenance.php?tab=franchisees" class="summary-card">
                 <i data-lucide="store" class="icon-badge" style="color: #3b82f6"></i>
                 <p class="label">Franchise Branches</p>
                 <div class="value"><?php echo $activeBranches; ?></div>
                 <p class="subtext">Registered branches</p>
             </a>
+        </div>
+
+        <!-- ── Top Items by Usage + Most Active Branches ── -->
+        <div class="content-grid" style="grid-template-columns:1fr 1fr;margin-bottom:1.5rem;">
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Top Items by Order History</h3>
+                </div>
+                <div class="rank-list">
+                <?php if (!empty($topItems)):
+                    $rank = 1;
+                    foreach ($topItems as $item): ?>
+                    <div class="rank-item">
+                        <div class="rank-num <?= $rank === 1 ? 'top' : '' ?>"><?= $rank ?></div>
+                        <div class="rank-info">
+                            <h4><?= htmlspecialchars($item['product_name'] ?? 'Unknown') ?></h4>
+                            <p><?= htmlspecialchars($item['category'] ?? '') ?> &middot; <?= $item['submission_count'] ?> submissions</p>
+                        </div>
+                        <div class="rank-qty">
+                            <?= number_format($item['total_qty']) ?>
+                            <span><?= htmlspecialchars($item['unit']) ?></span>
+                        </div>
+                    </div>
+                    <?php $rank++; endforeach;
+                else: ?>
+                    <p style="text-align:center;color:var(--muted);padding:2rem;">No usage data yet.</p>
+                <?php endif; ?>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>Most Active Branches <span style="font-size:.8rem;font-weight:400;color:var(--muted);">(by order history)</span></h3>
+                </div>
+                <div class="rank-list">
+                <?php if (!empty($topBranches)):
+                    $rank = 1;
+                    foreach ($topBranches as $branch): ?>
+                    <div class="rank-item">
+                        <div class="rank-num <?= $rank === 1 ? 'top' : '' ?>"><?= $rank ?></div>
+                        <div class="rank-info">
+                            <h4><?= htmlspecialchars($branch['branch_name'] ?? 'Unknown Branch') ?></h4>
+                            <?php if (!empty($branch['franchisee_name']) && $branch['franchisee_name'] !== $branch['branch_name']): ?>
+                            <p><?= htmlspecialchars($branch['franchisee_name']) ?></p>
+                            <?php endif; ?>
+                        </div>
+                        <div class="rank-qty">
+                            <?= number_format($branch['submissions']) ?>
+                            <span>usage reports</span>
+                        </div>
+                    </div>
+                    <?php $rank++; endforeach;
+                else: ?>
+                    <p style="text-align:center;color:var(--muted);padding:2rem;">No branch data yet.</p>
+                <?php endif; ?>
+                </div>
+            </div>
+
         </div>
 
         <!-- ── Recent Orders + Activity ── -->
@@ -339,11 +452,13 @@ function statusPillClass($status) {
                         <tr>
                             <td style="font-weight:700;"><?php echo htmlspecialchars($o['po_number']); ?></td>
                             <td>
-                                <div style="font-weight:600;"><?php echo htmlspecialchars($o['franchisee_name']); ?></div>
-                                <div style="font-size:0.78rem;color:var(--muted);"><?php echo htmlspecialchars($o['branch_name']); ?></div>
+                                <div style="font-weight:600;"><?php echo htmlspecialchars($o['branch_name']); ?></div>
+                                <?php if ($o['franchisee_name'] !== $o['branch_name']): ?>
+                                <div style="font-size:0.78rem;color:var(--muted);"><?php echo htmlspecialchars($o['franchisee_name']); ?></div>
+                                <?php endif; ?>
                             </td>
                             <td style="color:var(--muted);font-size:.85rem;"><?php echo timeAgo($o['created_at']); ?></td>
-                            <td><span class="status-pill <?php echo statusPillClass($o['status']); ?>"><?php echo htmlspecialchars($o['status']); ?></span></td>
+                            <td><span class="status-pill <?php echo statusPillClass($o['status']); ?>"><?php echo htmlspecialchars(statusLabel($o['status_step'] !== null ? (string)$o['status_step'] : $o['status'])); ?></span></td>
                             <td style="text-align:right;font-weight:600;">₱<?php echo number_format($o['total_amount'], 2); ?></td>
                         </tr>
                         <?php endforeach; ?>
@@ -380,44 +495,8 @@ function statusPillClass($status) {
             </div>
 
         </div>
-
-        <!-- ── Encoder Workload ── -->
-        <div class="card">
-            <div class="card-header">
-                <h3>Encoder Workload</h3>
-                <a href="admin-orders.php" class="card-link">Manage Assignments →</a>
-            </div>
-            <?php if (empty($encoderSummary)): ?>
-            <div class="empty-state">No active data encoders.</div>
-            <?php else:
-                $maxOrders = max(array_column($encoderSummary, 'active_orders'));
-                $maxOrders = max($maxOrders, 1); // prevent division by zero
-            ?>
-            <div>
-                <?php foreach ($encoderSummary as $enc):
-                    $count = (int)$enc['active_orders'];
-                    $pct   = round(($count / $maxOrders) * 100);
-                    if ($count === 0)     { $barClass = 'bar-free';  $countLabel = 'Available'; }
-                    elseif ($count <= 2)  { $barClass = 'bar-busy';  $countLabel = $count . ' order' . ($count > 1 ? 's' : ''); }
-                    else                  { $barClass = 'bar-heavy'; $countLabel = $count . ' orders'; }
-                ?>
-                <div class="encoder-row">
-                    <div class="encoder-row-left" style="min-width:160px;">
-                        <div class="enc-avatar"><i data-lucide="user" style="width:15px;height:15px;"></i></div>
-                        <span class="enc-name"><?php echo htmlspecialchars($enc['full_name']); ?></span>
-                    </div>
-                    <div class="workload-bar-wrap">
-                        <div class="workload-bar <?php echo $barClass; ?>" style="width:<?php echo ($count === 0 ? 4 : $pct); ?>%;"></div>
-                    </div>
-                    <span class="enc-count"><?php echo $countLabel; ?></span>
-                </div>
-                <?php endforeach; ?>
-            </div>
-            <?php endif; ?>
-        </div>
-
     </main>
-
-    <script>lucide.createIcons();</script>
+</div>
+<script>lucide.createIcons();</script>
 </body>
 </html>
