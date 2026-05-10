@@ -1,113 +1,106 @@
 <?php
-// ============================================================
-// rider-tracking.php — Delivery Tracking
-// Shows the rider's accepted orders as a list. Clicking one
-// opens the status-update view for that specific order.
-// ============================================================
 session_start();
-if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 5) { header('Location: index.php'); exit(); }
+
+if (!isset($_SESSION['user_id']) || $_SESSION['role_id'] != 5) {
+    header('Location: index.php');
+    exit();
+}
+
 header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 
-require_once 'db.php';
+require_once 'db.php'; // must create $pdo
 
-// Auto-add missing columns so the page never crashes on a fresh DB
-$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `delivery_status` VARCHAR(50)  NULL");
-$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `pod_photo`       VARCHAR(255) NULL");
-$conn->query("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `rider_id`        BIGINT(20)   NULL");
+// Auto-add missing columns
+try {
+    $pdo->exec("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `delivery_status` VARCHAR(50) NULL");
+    $pdo->exec("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `pod_photo` VARCHAR(255) NULL");
+    $pdo->exec("ALTER TABLE `orders` ADD COLUMN IF NOT EXISTS `rider_id` BIGINT(20) NULL");
+} catch (PDOException $e) {
+    // ignore if already exists / unsupported
+}
 
-$riderId   = $_SESSION['user_id'];
+$riderId = (int)$_SESSION['user_id'];
 $riderName = $_SESSION['full_name'] ?? 'Delivery Rider';
 
-// ── Handle POST: update delivery status ───────────────────────
 $actionMsg = '';
-$errorMsg  = '';
+$errorMsg = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $poNum  = trim($_POST['po']     ?? '');
+    $poNum = trim($_POST['po'] ?? '');
     $action = trim($_POST['action'] ?? '');
 
-    if ($poNum && in_array($action, ['pickedup','intransit','complete'])) {
-
-        $stmt = $conn->prepare("SELECT id, status_step FROM orders WHERE po_number = ? AND rider_id = ?");
-        $stmt->bind_param("si", $poNum, $riderId);
-        $stmt->execute();
-        $ord = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
+    if ($poNum && in_array($action, ['pickedup', 'intransit', 'complete'], true)) {
+        $stmt = $pdo->prepare("SELECT id, status_step FROM orders WHERE po_number = ? AND rider_id = ?");
+        $stmt->execute([$poNum, $riderId]);
+        $ord = $stmt->fetch();
 
         if ($ord) {
-            $orderId = $ord['id'];
+            $orderId = (int)$ord['id'];
 
             if ($action === 'pickedup') {
-                $label         = 'Picked Up';
+                $label = 'Picked Up';
                 $deliveryLabel = 'picked_up';
-                $detail        = 'Order collected from warehouse by delivery rider.';
-                $upd = $conn->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
-                $upd->bind_param("si", $deliveryLabel, $orderId);
-                $upd->execute(); $upd->close();
+                $detail = 'Order collected from warehouse by delivery rider.';
+
+                $upd = $pdo->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
+                $upd->execute([$deliveryLabel, $orderId]);
 
             } elseif ($action === 'intransit') {
-                $label         = 'In Transit';
+                $label = 'In Transit';
                 $deliveryLabel = 'in_transit';
-                $detail        = 'Order is en route to the franchisee branch.';
-                $upd = $conn->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
-                $upd->bind_param("si", $deliveryLabel, $orderId);
-                $upd->execute(); $upd->close();
+                $detail = 'Order is en route to the franchisee branch.';
+
+                $upd = $pdo->prepare("UPDATE orders SET delivery_status = ? WHERE id = ?");
+                $upd->execute([$deliveryLabel, $orderId]);
 
             } elseif ($action === 'complete') {
                 if (empty($_FILES['pod_photo']['tmp_name'])) {
                     $errorMsg = 'Please attach a proof-of-delivery photo before confirming.';
                 } else {
-                    $file     = $_FILES['pod_photo'];
-                    $allowed  = ['image/jpeg','image/png','image/webp','image/gif'];
+                    $file = $_FILES['pod_photo'];
+                    $allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
                     $maxBytes = 5 * 1024 * 1024;
 
-                    if (!in_array($file['type'], $allowed)) {
+                    if (!in_array($file['type'], $allowed, true)) {
                         $errorMsg = 'Invalid file type. Please upload a JPEG, PNG, or WebP image.';
                     } elseif ($file['size'] > $maxBytes) {
                         $errorMsg = 'Photo is too large. Maximum size is 5 MB.';
                     } else {
                         $uploadDir = __DIR__ . '/uploads/pod/';
-                        if (!is_dir($uploadDir)) { mkdir($uploadDir, 0755, true); }
-                        $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
+                        if (!is_dir($uploadDir)) {
+                            mkdir($uploadDir, 0755, true);
+                        }
+
+                        $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
                         $filename = 'pod_' . $orderId . '_' . time() . '.' . $ext;
-                        $dest     = $uploadDir . $filename;
+                        $dest = $uploadDir . $filename;
 
                         if (!move_uploaded_file($file['tmp_name'], $dest)) {
                             $errorMsg = 'Failed to save photo. Please try again.';
                         } else {
-                            $podPath       = 'uploads/pod/' . $filename;
-                            $label         = 'Delivered';
+                            $podPath = 'uploads/pod/' . $filename;
+                            $label = 'Delivered';
                             $deliveryLabel = 'delivered';
-                            $newStep       = 4;
-                            $newStatus     = 'completed';
-                            $detail        = 'Order successfully delivered to franchisee.';
+                            $newStep = 4;
+                            $newStatus = 'completed';
+                            $detail = 'Order successfully delivered to franchisee.';
 
-                            $upd = $conn->prepare("
+                            $upd = $pdo->prepare("
                                 UPDATE orders
                                 SET `status` = ?, status_step = ?, delivery_status = ?, pod_photo = ?
                                 WHERE id = ?
                             ");
-                            if (!$upd) {
-                                die("Prepare failed (orders UPDATE): " . htmlspecialchars($conn->error));
-                            }
-                            $upd->bind_param("sissi", $newStatus, $newStep, $deliveryLabel, $podPath, $orderId);
-                            $upd->execute(); $upd->close();
+                            $upd->execute([$newStatus, $newStep, $deliveryLabel, $podPath, $orderId]);
 
-                            $stepNum = 4;
-                            $ins = $conn->prepare("
+                            $ins = $pdo->prepare("
                                 INSERT INTO order_status_history
                                     (order_id, status_step, status_label, detail, changed_at, changed_by)
                                 VALUES (?, ?, ?, ?, NOW(), ?)
                             ");
-                            if (!$ins) {
-                                die("Prepare failed (order_status_history INSERT): " . htmlspecialchars($conn->error));
-                            }
-                            $ins->bind_param("iissi", $orderId, $stepNum, $label, $detail, $riderId);
-                            $ins->execute(); $ins->close();
+                            $ins->execute([$orderId, 4, $label, $detail, $riderId]);
 
-                            $conn->close();
                             header("Location: rider-tracking.php?done=1");
                             exit();
                         }
@@ -115,31 +108,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
-            // Log history for non-complete actions
             if (!$errorMsg && $action !== 'complete') {
-                $stepNum = 3;
-                $ins = $conn->prepare("
+                $ins = $pdo->prepare("
                     INSERT INTO order_status_history
                         (order_id, status_step, status_label, detail, changed_at, changed_by)
                     VALUES (?, ?, ?, ?, NOW(), ?)
                 ");
-                $ins->bind_param("iissi", $orderId, $stepNum, $label, $detail, $riderId);
-                $ins->execute(); $ins->close();
+                $ins->execute([$orderId, 3, $label, $detail, $riderId]);
+
                 $actionMsg = $label;
             }
         }
     }
 }
 
-// ── Determine view mode: list or detail ───────────────────────
 $selectedPO = trim($_GET['po'] ?? $_POST['po'] ?? '');
-$order      = null;
+$order = null;
 $orderItems = [];
-$history    = [];
+$history = [];
 
-// ── Always load the rider's active orders for the list ─────────
 $myOrders = [];
-$res = $conn->query("
+
+$stmt = $pdo->prepare("
     SELECT o.id, o.po_number, o.delivery_preference, o.total_amount,
            o.estimated_pickup, o.delivery_status,
            COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name,
@@ -147,16 +137,16 @@ $res = $conn->query("
     FROM orders o
     LEFT JOIN franchisees f ON f.id = o.franchisee_id
     LEFT JOIN users uf ON uf.user_id = f.user_id
-    WHERE o.rider_id = $riderId
+    WHERE o.rider_id = ?
       AND o.status_step = 3
       AND o.delivery_status != 'delivered'
     ORDER BY o.estimated_pickup ASC, o.created_at ASC
 ");
-if ($res) { while ($row = $res->fetch_assoc()) { $myOrders[] = $row; } }
+$stmt->execute([$riderId]);
+$myOrders = $stmt->fetchAll();
 
-// ── Load detail if a PO is selected ───────────────────────────
 if ($selectedPO) {
-    $stmt = $conn->prepare("
+    $stmt = $pdo->prepare("
         SELECT o.*, f.branch_name,
                COALESCE(f.franchisee_name, uf.full_name, '—') AS franchisee_name
         FROM orders o
@@ -164,52 +154,42 @@ if ($selectedPO) {
         LEFT JOIN users uf ON uf.user_id = f.user_id
         WHERE o.po_number = ? AND o.rider_id = ?
     ");
-    $stmt->bind_param("si", $selectedPO, $riderId);
-    $stmt->execute();
-    $order = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
+    $stmt->execute([$selectedPO, $riderId]);
+    $order = $stmt->fetch();
 
     if ($order) {
-        $stmt = $conn->prepare("
+        $stmt = $pdo->prepare("
             SELECT oi.quantity, oi.unit_price, oi.subtotal, p.name, p.unit
-            FROM order_items oi JOIN products p ON p.id = oi.product_id
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
             WHERE oi.order_id = ?
         ");
-        $stmt->bind_param("i", $order['id']);
-        $stmt->execute();
-        $r = $stmt->get_result();
-        while ($row = $r->fetch_assoc()) { $orderItems[] = $row; }
-        $stmt->close();
+        $stmt->execute([$order['id']]);
+        $orderItems = $stmt->fetchAll();
 
-        $stmt = $conn->prepare("
+        $stmt = $pdo->prepare("
             SELECT status_label, detail, changed_at
-            FROM order_status_history WHERE order_id = ?
+            FROM order_status_history
+            WHERE order_id = ?
             ORDER BY changed_at DESC
         ");
-        $stmt->bind_param("i", $order['id']);
-        $stmt->execute();
-        $r = $stmt->get_result();
-        while ($row = $r->fetch_assoc()) { $history[] = $row; }
-        $stmt->close();
+        $stmt->execute([$order['id']]);
+        $history = $stmt->fetchAll();
     }
 }
 
-$conn->close();
-
-// ── Delivery status helpers ────────────────────────────────────
 $deliveryStatus = $order['delivery_status'] ?? '';
-$isPickedUp  = in_array($deliveryStatus, ['picked_up','in_transit','delivered']);
-$isInTransit = in_array($deliveryStatus, ['in_transit','delivered']);
+$isPickedUp = in_array($deliveryStatus, ['picked_up', 'in_transit', 'delivered'], true);
+$isInTransit = in_array($deliveryStatus, ['in_transit', 'delivered'], true);
 $isCompleted = $deliveryStatus === 'delivered' || ($order['status'] ?? '') === 'completed';
 
-// ── Delivery status badge helper ───────────────────────────────
 function deliveryBadge(string $ds): array {
     return match($ds) {
-        'accepted'   => ['label' => 'Accepted',    'color' => '#3b82f6', 'bg' => '#dbeafe'],
-        'picked_up'  => ['label' => 'Picked Up',   'color' => '#f59e0b', 'bg' => '#fef3c7'],
-        'in_transit' => ['label' => 'In Transit',  'color' => '#8b5cf6', 'bg' => '#ede9fe'],
-        'delivered'  => ['label' => 'Delivered',   'color' => '#10b981', 'bg' => '#dcfce7'],
-        default      => ['label' => 'Pending',     'color' => '#6b7280', 'bg' => '#f3f4f6'],
+        'accepted' => ['label' => 'Accepted', 'color' => '#3b82f6', 'bg' => '#dbeafe'],
+        'picked_up' => ['label' => 'Picked Up', 'color' => '#f59e0b', 'bg' => '#fef3c7'],
+        'in_transit' => ['label' => 'In Transit', 'color' => '#8b5cf6', 'bg' => '#ede9fe'],
+        'delivered' => ['label' => 'Delivered', 'color' => '#10b981', 'bg' => '#dcfce7'],
+        default => ['label' => 'Pending', 'color' => '#6b7280', 'bg' => '#f3f4f6'],
     };
 }
 ?>
